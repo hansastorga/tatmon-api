@@ -295,3 +295,22 @@ def probe():
         except Exception as e:
             results[ep] = {"status": "error", "msg": str(e)[:60]}
     return jsonify(results)
+
+@app.route("/payments/raw")
+def payments_raw():
+    """Primeros 5 pagos en crudo para ver estructura completa."""
+    if not MGR_KEY:
+        return jsonify({"error": "MGR_API_KEY no configurada"}), 500
+    headers = {"Authorization": MGR_KEY.strip(), "Accept": "application/json"}
+    try:
+        r = requests.get(f"{MGR_BASE}/payments", headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        sample = data[:5] if isinstance(data, list) else (data.get("payments") or data.get("data") or [])[:5]
+        return jsonify({
+            "sample": sample,
+            "total_campos": list(sample[0].keys()) if sample else [],
+            "total_registros_pagina1": len(data) if isinstance(data, list) else len(data.get("payments") or data.get("data") or [])
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
