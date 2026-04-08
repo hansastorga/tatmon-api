@@ -106,10 +106,8 @@ def fetch_tickets_for_tienda(nombre, api_key):
     all_tickets = []
     page = 1
     headers = {"Authorization": api_key.strip(), "Accept": "application/json"}
-    # Fecha límite: solo traemos tickets dentro de la ventana
-    # MGR no filtra por fecha en el API, así que paramos cuando
-    # el batch más antiguo ya está fuera de la ventana
     desde = (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
+    consecutive_old = 0  # páginas consecutivas con todos los tickets fuera de ventana
     while True:
         try:
             r = requests.get(f"{MGR_BASE}/tickets", headers=headers,
@@ -119,15 +117,24 @@ def fetch_tickets_for_tienda(nombre, api_key):
             batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
             if not batch:
                 break
-            # Filtrar por ventana de tiempo
-            en_ventana = [t for t in batch if dentro_ventana(t, desde)]
-            for t in en_ventana:
-                t["_tienda"] = nombre
+            # Filtrar por ventana — pero siempre incluir tickets sin fecha
+            en_ventana = []
+            fuera = 0
+            for t in batch:
+                fecha = date_str(t.get("created_date", ""))
+                if not fecha or fecha >= desde:
+                    t["_tienda"] = nombre
+                    en_ventana.append(t)
+                else:
+                    fuera += 1
             all_tickets.extend(en_ventana)
-            # Si el ticket más antiguo del batch ya está fuera de la ventana, parar
-            fechas_batch = [date_str(t.get("created_date","")) for t in batch if t.get("created_date")]
-            if fechas_batch and min(fechas_batch) < desde:
-                break
+            # Parar solo si TODA la página está fuera de ventana (2 páginas consecutivas)
+            if fuera == len(batch):
+                consecutive_old += 1
+                if consecutive_old >= 2:
+                    break
+            else:
+                consecutive_old = 0
             if len(batch) < 50:
                 break
             page += 1
@@ -135,7 +142,7 @@ def fetch_tickets_for_tienda(nombre, api_key):
         except Exception as e:
             print(f"[ERROR] {nombre} pág {page}: {e}")
             break
-    print(f"[INFO] {nombre}: {len(all_tickets)} tickets (últimos {DIAS_VENTANA} días)")
+    print(f"[INFO] {nombre}: {len(all_tickets)} tickets (ventana {DIAS_VENTANA}d, desde {desde})")
     return nombre, all_tickets
 
 def fetch_all_parallel():
