@@ -351,3 +351,37 @@ def tickets_raw():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/debug/tiendas")
+def debug_tiendas():
+    """Diagnóstico detallado por tienda."""
+    results = {}
+    for nombre, key in TIENDAS_CONFIG.items():
+        if not key:
+            results[nombre] = {"error": "sin key"}
+            continue
+        headers = {"Authorization": key.strip(), "Accept": "application/json"}
+        try:
+            r = requests.get(f"{MGR_BASE}/tickets",
+                           headers=headers,
+                           params={"page": 1},
+                           timeout=10)
+            data = r.json()
+            if isinstance(data, list):
+                count = len(data)
+                sample = data[0] if data else {}
+            else:
+                tickets = data.get("tickets") or data.get("data") or []
+                count = len(tickets)
+                sample = tickets[0] if tickets else {}
+            results[nombre] = {
+                "status":       r.status_code,
+                "count_pag1":   count,
+                "invoice_keys": list((sample.get("invoice") or {}).keys()) if sample else [],
+                "invoice_sample": sample.get("invoice") if sample else None,
+                "primer_ref":   sample.get("ticket_ref") if sample else None,
+                "primer_tec_email": (sample.get("technician") or {}).get("email") if sample else None,
+            }
+        except Exception as e:
+            results[nombre] = {"error": str(e)}
+    return jsonify(results)
