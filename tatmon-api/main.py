@@ -1,9 +1,7 @@
-import os
-import time
-import requests
-from datetime import datetime, timezone, date
+import os, time, requests
+from datetime import datetime, timezone, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -12,11 +10,11 @@ CORS(app)
 MGR_BASE = "https://api.mygadgetrepairs.com/v1"
 
 TIENDAS_CONFIG = {
-    "Tatmon La Villa":         os.environ.get("MGR_API_KEY_LAVILLA", ""),
-    "Tatmon Kalú":             os.environ.get("MGR_API_KEY_KALU", ""),
-    "Tatmon Cayalá":           os.environ.get("MGR_API_KEY_CAYALA", ""),
-    "Tatmon Quiché":           os.environ.get("MGR_API_KEY_QUICHE", ""),
-    "Tatmon Quetzaltenango":   os.environ.get("MGR_API_KEY_XELA", ""),
+    "Tatmon La Villa":       os.environ.get("MGR_API_KEY_LAVILLA", ""),
+    "Tatmon Kalú":           os.environ.get("MGR_API_KEY_KALU", ""),
+    "Tatmon Cayalá":         os.environ.get("MGR_API_KEY_CAYALA", ""),
+    "Tatmon Quiché":         os.environ.get("MGR_API_KEY_QUICHE", ""),
+    "Tatmon Quetzaltenango": os.environ.get("MGR_API_KEY_XELA", ""),
 }
 
 VENTAS_TIPOS = {"venta de equipos.", "compra", "venta", "reserva"}
@@ -26,6 +24,9 @@ EST_ACT  = {
     "Cliente ha autorizado la reparación", "Repuesto Local",
     "Paquete del interior", "Esta en taller Ajeno", "Recolección"
 }
+
+# Solo mostramos tickets de los últimos N días
+DIAS_VENTANA = int(os.environ.get("DIAS_VENTANA", "30"))
 
 _cache     = {"data": None, "ts": 0}
 _cache_all = {"data": None, "ts": 0}
@@ -39,10 +40,9 @@ def get_tecnico_nombre(ticket):
     fname = (tec.get("first_name") or "").strip()
     lname = (tec.get("last_name") or "").strip()
     full  = f"{fname} {lname}".strip()
-    # Si el email o nombre coincide con una cuenta de tienda, no es técnico real
-    tienda_keywords = ["cayalá","cayala","kalú","kalu","villa","quiché",
-                       "quiche","quetzaltenango","xela","tatmon"]
-    if any(kw in email for kw in tienda_keywords):
+    tienda_kw = ["cayalá","cayala","kalú","kalu","villa","quiché",
+                 "quiche","quetzaltenango","xela","tatmon"]
+    if any(kw in email for kw in tienda_kw):
         return ""
     if full.lower().startswith("tatmon"):
         return ""
@@ -56,9 +56,11 @@ def parse_total(ticket):
     inv = ticket.get("invoice") or {}
     for key in ("amount", "total", "grand_total", "subtotal", "paid"):
         v = inv.get(key)
-        if v is not None and v != "" and float(str(v).replace("Q","").replace(",","").strip() or 0) > 0:
+        if v is not None and v != "":
             try:
-                return float(str(v).replace("Q","").replace(",","").strip())
+                f = float(str(v).replace("Q","").replace(",","").strip())
+                if f > 0:
+                    return f
             except:
                 pass
     return 0.0
@@ -75,8 +77,7 @@ def cycle_time_hours(ticket):
         c = datetime.strptime(ticket["created_date"], fmt)
         u = datetime.strptime(ticket["last_updated"],  fmt)
         diff = (u - c).total_seconds() / 3600
-        # Ignorar cycle times irreales (> 30 días = ticket viejo sin cerrar bien)
-        return round(diff, 1) if diff < 720 else None
+        return round(diff, 1) if 0 < diff < 720 else None
     except:
         return None
 
@@ -93,18 +94,22 @@ def classify_ticket(ticket, hoy_str):
         return "pipeline_sin_cobrar"
     return "otro"
 
-# ── fetch por tienda ──────────────────────────────────────
+def dentro_ventana(ticket, desde_str):
+    creado = date_str(ticket.get("created_date", ""))
+    return creado >= desde_str
 
-def fetch_tickets_for_tienda(tienda_nombre, api_key):
-    """Jala todos los tickets de una tienda específica."""
+# ── fetch ─────────────────────────────────────────────────
+
+def fetch_tickets_for_tienda(nombre, api_key):
     if not api_key:
-        print(f"[WARN] Sin API key para {tienda_nombre}")
-        return tienda_nombre, []
-
+        return nombre, []
     all_tickets = []
     page = 1
     headers = {"Authorization": api_key.strip(), "Accept": "application/json"}
-
+    # Fecha límite: solo traemos tickets dentro de la ventana
+    # MGR no filtra por fecha en el API, así que paramos cuando
+    # el batch más antiguo ya está fuera de la ventana
+    desde = (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
     while True:
         try:
             r = requests.get(f"{MGR_BASE}/tickets", headers=headers,
@@ -114,41 +119,42 @@ def fetch_tickets_for_tienda(tienda_nombre, api_key):
             batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
             if not batch:
                 break
-            # Inyectar tienda en cada ticket
-            for t in batch:
-                t["_tienda"] = tienda_nombre
-            all_tickets.extend(batch)
+            # Filtrar por ventana de tiempo
+            en_ventana = [t for t in batch if dentro_ventana(t, desde)]
+            for t in en_ventana:
+                t["_tienda"] = nombre
+            all_tickets.extend(en_ventana)
+            # Si el ticket más antiguo del batch ya está fuera de la ventana, parar
+            fechas_batch = [date_str(t.get("created_date","")) for t in batch if t.get("created_date")]
+            if fechas_batch and min(fechas_batch) < desde:
+                break
             if len(batch) < 50:
                 break
             page += 1
             time.sleep(0.3)
         except Exception as e:
-            print(f"[ERROR] {tienda_nombre} pág {page}: {e}")
+            print(f"[ERROR] {nombre} pág {page}: {e}")
             break
+    print(f"[INFO] {nombre}: {len(all_tickets)} tickets (últimos {DIAS_VENTANA} días)")
+    return nombre, all_tickets
 
-    print(f"[INFO] {tienda_nombre}: {len(all_tickets)} tickets")
-    return tienda_nombre, all_tickets
-
-def fetch_all_tickets_parallel():
-    """Jala todas las tiendas en paralelo."""
+def fetch_all_parallel():
     all_tickets = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {
-            executor.submit(fetch_tickets_for_tienda, nombre, key): nombre
-            for nombre, key in TIENDAS_CONFIG.items()
-            if key
-        }
-        for future in as_completed(futures):
-            tienda_nombre, tickets = future.result()
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(fetch_tickets_for_tienda, n, k): n
+                   for n, k in TIENDAS_CONFIG.items() if k}
+        for f in as_completed(futures):
+            _, tickets = f.result()
             all_tickets.extend(tickets)
     return all_tickets
 
-# ── KPI compute ───────────────────────────────────────────
+# ── compute ───────────────────────────────────────────────
 
 def compute_kpis(tickets):
-    hoy_str = date.today().isoformat()
-    tiendas = {}
-    cats    = {"venta_limpia": [], "cobro_cartera": [], "pipeline_sin_cobrar": []}
+    hoy_str  = date.today().isoformat()
+    desde    = (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
+    tiendas  = {}
+    cats     = {"venta_limpia":[], "cobro_cartera":[], "pipeline_sin_cobrar":[]}
 
     for t in tickets:
         tienda  = t.get("_tienda") or "Sin tienda"
@@ -157,7 +163,7 @@ def compute_kpis(tickets):
         total   = parse_total(t)
         ct      = cycle_time_hours(t)
         venta   = is_venta(t)
-        ref     = t.get("ticket_ref") or t.get("id") or ""
+        ref     = t.get("ticket_ref") or ""
         cat     = classify_ticket(t, hoy_str)
 
         if cat in cats:
@@ -210,7 +216,6 @@ def compute_kpis(tickets):
             elif estado in EST_ACT:
                 tec["wip"] += 1
 
-    # Promedios y orden
     for td in tiendas.values():
         cts = td.pop("cycle_times", [])
         td["cycle_time_avg_hrs"] = round(sum(cts)/len(cts), 1) if cts else None
@@ -228,19 +233,19 @@ def compute_kpis(tickets):
     sa_vta    = sum(td["sin_asignar_vta"] for td in tiendas.values())
     all_cts   = [td["cycle_time_avg_hrs"] for td in tiendas.values() if td["cycle_time_avg_hrs"]]
 
-    def cat_summary(tlist):
+    def cat_sum(lst):
         return {
-            "count":      len(tlist),
-            "revenue":    round(sum(parse_total(t) for t in tlist), 2),
+            "count":   len(lst),
+            "revenue": round(sum(parse_total(t) for t in lst), 2),
             "por_tienda": {
-                n: sum(1 for t in tlist if t.get("_tienda") == n)
-                for n in TIENDAS_CONFIG.keys()
-                if any(t.get("_tienda") == n for t in tlist)
+                n: sum(1 for t in lst if t.get("_tienda")==n)
+                for n in TIENDAS_CONFIG if any(t.get("_tienda")==n for t in lst)
             }
         }
 
     return {
-        "hoy":    hoy_str,
+        "hoy":       hoy_str,
+        "ventana":   f"últimos {DIAS_VENTANA} días (desde {desde})",
         "red": {
             "total":              total_red,
             "completados":        comp_red,
@@ -253,33 +258,33 @@ def compute_kpis(tickets):
         },
         "tiendas": list(tiendas.values()),
         "categorias_dia": {
-            "venta_limpia":        cat_summary(cats["venta_limpia"]),
-            "cobro_cartera":       cat_summary(cats["cobro_cartera"]),
-            "pipeline_sin_cobrar": cat_summary(cats["pipeline_sin_cobrar"]),
+            "venta_limpia":        cat_sum(cats["venta_limpia"]),
+            "cobro_cartera":       cat_sum(cats["cobro_cartera"]),
+            "pipeline_sin_cobrar": cat_sum(cats["pipeline_sin_cobrar"]),
         },
         "tiendas_status": {
-            nombre: "ok" if key else "sin_key"
-            for nombre, key in TIENDAS_CONFIG.items()
+            n: "ok" if k else "sin_key"
+            for n, k in TIENDAS_CONFIG.items()
         },
+        "tiendas_activas": [n for n, k in TIENDAS_CONFIG.items() if k],
         "total_tickets_raw": len(tickets),
-        "updated_at":        datetime.now(timezone.utc).isoformat()
+        "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
 def get_kpis_cached():
     now = time.time()
     if _cache["data"] is None or (now - _cache["ts"]) > CACHE_TTL:
-        print("[INFO] Actualizando KPIs — jalando 5 tiendas...")
-        tickets = fetch_all_tickets_parallel()
+        print(f"[INFO] Jalando tickets (ventana {DIAS_VENTANA} días)...")
+        tickets = fetch_all_parallel()
         _cache["data"] = compute_kpis(tickets)
         _cache["ts"]   = now
-        print(f"[INFO] Total: {len(tickets)} tickets de {len(TIENDAS_CONFIG)} tiendas")
+        print(f"[INFO] Total: {len(tickets)} tickets")
     return _cache["data"]
 
 def get_all_cached():
     now = time.time()
     if _cache_all["data"] is None or (now - _cache_all["ts"]) > CACHE_TTL:
-        print("[INFO] Actualizando tickets/all...")
-        tickets = fetch_all_tickets_parallel()
+        tickets = fetch_all_parallel()
         _cache_all["data"] = tickets
         _cache_all["ts"]   = now
     return _cache_all["data"]
@@ -290,11 +295,10 @@ def get_all_cached():
 def health():
     keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
     return jsonify({
-        "status":  "ok",
-        "service": "Tatmon Producción API",
-        "version": "4.0",
+        "status": "ok", "service": "Tatmon API", "version": "4.1",
         "tiendas_configuradas": keys_ok,
-        "tiendas": {n: "✓" if k else "✗ sin key" for n, k in TIENDAS_CONFIG.items()}
+        "ventana_dias": DIAS_VENTANA,
+        "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}
     })
 
 @app.route("/kpis")
@@ -306,28 +310,28 @@ def kpis():
 
 @app.route("/kpis/refresh")
 def refresh():
-    _cache["data"]     = None
-    _cache["ts"]       = 0
-    _cache_all["data"] = None
-    _cache_all["ts"]   = 0
+    _cache["data"] = _cache_all["data"] = None
+    _cache["ts"]   = _cache_all["ts"]   = 0
     data = get_kpis_cached()
-    return jsonify({"ok": True, "updated_at": data["updated_at"],
-                    "total_tickets": data["total_tickets_raw"]})
+    return jsonify({
+        "ok": True,
+        "total_tickets": data["total_tickets_raw"],
+        "ventana": data["ventana"],
+        "tiendas_activas": data["tiendas_activas"],
+        "updated_at": data["updated_at"]
+    })
 
 @app.route("/tickets/all")
 def tickets_all():
     try:
         tickets = get_all_cached()
-        return jsonify({
-            "tickets":    tickets,
-            "total":      len(tickets),
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        })
+        return jsonify({"tickets": tickets, "total": len(tickets),
+                        "updated_at": datetime.now(timezone.utc).isoformat()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/tickets/raw")
-def tickets_raw():
+@app.route("/debug/tiendas")
+def debug_tiendas():
     results = {}
     for nombre, key in TIENDAS_CONFIG.items():
         if not key:
@@ -335,14 +339,22 @@ def tickets_raw():
             continue
         headers = {"Authorization": key.strip(), "Accept": "application/json"}
         try:
-            r = requests.get(f"{MGR_BASE}/tickets", headers=headers, timeout=10)
-            data   = r.json()
-            sample = data[:1] if isinstance(data, list) else (data.get("tickets") or [])[:1]
+            r = requests.get(f"{MGR_BASE}/tickets", headers=headers,
+                             params={"page": 1}, timeout=10)
+            data = r.json()
+            if isinstance(data, list):
+                batch = data
+            else:
+                batch = data.get("tickets") or data.get("data") or []
+            sample = batch[0] if batch else {}
             results[nombre] = {
-                "status": r.status_code,
-                "count_pag1": len(data) if isinstance(data, list) else len(data.get("tickets") or []),
-                "campos": list(sample[0].keys()) if sample else [],
-                "invoice_sample": sample[0].get("invoice") if sample else None
+                "status":        r.status_code,
+                "count_pag1":    len(batch),
+                "invoice_keys":  list((sample.get("invoice") or {}).keys()),
+                "invoice_sample": sample.get("invoice"),
+                "primer_ref":    sample.get("ticket_ref"),
+                "primer_fecha":  date_str(sample.get("created_date","")),
+                "primer_tec_email": (sample.get("technician") or {}).get("email"),
             }
         except Exception as e:
             results[nombre] = {"error": str(e)}
@@ -351,37 +363,3 @@ def tickets_raw():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-@app.route("/debug/tiendas")
-def debug_tiendas():
-    """Diagnóstico detallado por tienda."""
-    results = {}
-    for nombre, key in TIENDAS_CONFIG.items():
-        if not key:
-            results[nombre] = {"error": "sin key"}
-            continue
-        headers = {"Authorization": key.strip(), "Accept": "application/json"}
-        try:
-            r = requests.get(f"{MGR_BASE}/tickets",
-                           headers=headers,
-                           params={"page": 1},
-                           timeout=10)
-            data = r.json()
-            if isinstance(data, list):
-                count = len(data)
-                sample = data[0] if data else {}
-            else:
-                tickets = data.get("tickets") or data.get("data") or []
-                count = len(tickets)
-                sample = tickets[0] if tickets else {}
-            results[nombre] = {
-                "status":       r.status_code,
-                "count_pag1":   count,
-                "invoice_keys": list((sample.get("invoice") or {}).keys()) if sample else [],
-                "invoice_sample": sample.get("invoice") if sample else None,
-                "primer_ref":   sample.get("ticket_ref") if sample else None,
-                "primer_tec_email": (sample.get("technician") or {}).get("email") if sample else None,
-            }
-        except Exception as e:
-            results[nombre] = {"error": str(e)}
-    return jsonify(results)
