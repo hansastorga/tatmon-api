@@ -2,80 +2,51 @@ import os
 import time
 import requests
 from datetime import datetime, timezone, date
-from flask import Flask, jsonify, request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from flask import Flask, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
 MGR_BASE = "https://api.mygadgetrepairs.com/v1"
-MGR_KEY  = os.environ.get("MGR_API_KEY", "")
+
+TIENDAS_CONFIG = {
+    "Tatmon La Villa":         os.environ.get("MGR_API_KEY_LAVILLA", ""),
+    "Tatmon Kalú":             os.environ.get("MGR_API_KEY_KALU", ""),
+    "Tatmon Cayalá":           os.environ.get("MGR_API_KEY_CAYALA", ""),
+    "Tatmon Quiché":           os.environ.get("MGR_API_KEY_QUICHE", ""),
+    "Tatmon Quetzaltenango":   os.environ.get("MGR_API_KEY_XELA", ""),
+}
 
 VENTAS_TIPOS = {"venta de equipos.", "compra", "venta", "reserva"}
-STORE_NAMES  = {
-    "tatmon kalu", "tatmon la villa", "tatmon cayalá",
-    "tatmon quiché", "tatmon quetzaltenango",
-    "tatmon cayala", "tatmon quiche"
-}
 EST_TERM = {"Completado", "Finalizado / Entregado", "Facturado"}
 EST_ACT  = {
     "Nuevo", "En progreso", "En espera de autorización del cliente",
     "Cliente ha autorizado la reparación", "Repuesto Local",
     "Paquete del interior", "Esta en taller Ajeno", "Recolección"
 }
-TIENDA_EMAIL_MAP = {
-    "tiendacayala@tatmon.com":         "Tatmon Cayalá",
-    "tiendakalu@tatmon.com":           "Tatmon Kalú",
-    "tiendalavilla@tatmon.com":        "Tatmon La Villa",
-    "tiendaquiche@tatmon.com":         "Tatmon Quiché",
-    "tiendaquetzaltenango@tatmon.com": "Tatmon Quetzaltenango",
-}
 
-_cache      = {"data": None, "ts": 0}
-_cache_all  = {"data": None, "ts": 0}
-CACHE_TTL   = 3600
+_cache     = {"data": None, "ts": 0}
+_cache_all = {"data": None, "ts": 0}
+CACHE_TTL  = 3600
 
 # ── helpers ──────────────────────────────────────────────
-
-def get_tienda(ticket):
-    tec   = ticket.get("technician") or {}
-    email = (tec.get("email") or "").lower().strip()
-    if email in TIENDA_EMAIL_MAP:
-        return TIENDA_EMAIL_MAP[email]
-    fname = (tec.get("first_name") or "").strip()
-    lname = (tec.get("last_name") or "").strip()
-    full  = f"{fname} {lname}".strip().lower()
-    # Match by first name containing tienda keyword
-    tienda_keywords = {
-        "cayalá": "Tatmon Cayalá", "cayala": "Tatmon Cayalá",
-        "kalú": "Tatmon Kalú",   "kalu": "Tatmon Kalú",
-        "villa": "Tatmon La Villa",
-        "quiché": "Tatmon Quiché", "quiche": "Tatmon Quiché",
-        "quetzaltenango": "Tatmon Quetzaltenango", "xela": "Tatmon Quetzaltenango",
-    }
-    for kw, name in tienda_keywords.items():
-        if kw in full:
-            return name
-    # If technician has no email and no recognizable name but has an id, mark as unassigned store
-    if not email and not fname:
-        return "Sin tienda"
-    # Real technician — determine tienda from ticket_ref prefix
-    ref = ticket.get("ticket_ref") or ""
-    ref_map = {"CY": "Tatmon Cayalá", "K": "Tatmon Kalú", "L": "Tatmon La Villa",
-               "CQ": "Tatmon Quiché", "Q": "Tatmon Quetzaltenango"}
-    for prefix, name in ref_map.items():
-        if ref.startswith(prefix + "-"):
-            return name
-    return "Sin tienda"
 
 def get_tecnico_nombre(ticket):
     tec   = ticket.get("technician") or {}
     email = (tec.get("email") or "").lower().strip()
-    if email in TIENDA_EMAIL_MAP:
+    fname = (tec.get("first_name") or "").strip()
+    lname = (tec.get("last_name") or "").strip()
+    full  = f"{fname} {lname}".strip()
+    # Si el email o nombre coincide con una cuenta de tienda, no es técnico real
+    tienda_keywords = ["cayalá","cayala","kalú","kalu","villa","quiché",
+                       "quiche","quetzaltenango","xela","tatmon"]
+    if any(kw in email for kw in tienda_keywords):
         return ""
-    fname = tec.get("first_name") or ""
-    lname = tec.get("last_name") or ""
-    return f"{fname} {lname}".strip()
+    if full.lower().startswith("tatmon"):
+        return ""
+    return full
 
 def is_venta(ticket):
     tipo = (ticket.get("issue_type") or {}).get("label") or ""
@@ -83,21 +54,17 @@ def is_venta(ticket):
 
 def parse_total(ticket):
     inv = ticket.get("invoice") or {}
-    # MGR /tickets list returns: invoice.amount (the paid amount)
-    for key in ("amount", "total", "grand_total", "subtotal"):
+    for key in ("amount", "total", "grand_total", "subtotal", "paid"):
         v = inv.get(key)
-        if v is not None and v != "" and v != 0:
+        if v is not None and v != "" and float(str(v).replace("Q","").replace(",","").strip() or 0) > 0:
             try:
-                return float(str(v).replace("Q", "").replace(",", "").strip())
+                return float(str(v).replace("Q","").replace(",","").strip())
             except:
                 pass
     return 0.0
 
 def date_str(iso):
-    """Extrae YYYY-MM-DD de una cadena ISO, tolerando offsets."""
-    if not iso:
-        return ""
-    return str(iso)[:10]
+    return str(iso or "")[:10]
 
 def cycle_time_hours(ticket):
     estado = (ticket.get("status") or {}).get("label") or ""
@@ -107,35 +74,37 @@ def cycle_time_hours(ticket):
         fmt = "%Y-%m-%dT%H:%M:%S%z"
         c = datetime.strptime(ticket["created_date"], fmt)
         u = datetime.strptime(ticket["last_updated"],  fmt)
-        return round((u - c).total_seconds() / 3600, 1)
+        diff = (u - c).total_seconds() / 3600
+        # Ignorar cycle times irreales (> 30 días = ticket viejo sin cerrar bien)
+        return round(diff, 1) if diff < 720 else None
     except:
         return None
 
 def classify_ticket(ticket, hoy_str):
-    """
-    Clasifica cada ticket en una de 3 categorías según
-    fecha de creación vs fecha de último pago.
-    """
     creado = date_str(ticket.get("created_date", ""))
     inv    = ticket.get("invoice") or {}
     pagado = date_str(inv.get("last_payment_date", ""))
     paid   = bool(pagado)
-
     if creado == hoy_str and paid and pagado == hoy_str:
-        return "venta_limpia"       # ticket nuevo + cobrado hoy
+        return "venta_limpia"
     elif creado < hoy_str and paid and pagado == hoy_str:
-        return "cobro_cartera"      # ticket anterior + cobrado hoy
+        return "cobro_cartera"
     elif creado == hoy_str and not paid:
-        return "pipeline_sin_cobrar"  # ticket nuevo + sin cobrar
-    else:
-        return "otro"
+        return "pipeline_sin_cobrar"
+    return "otro"
 
-# ── fetch ─────────────────────────────────────────────────
+# ── fetch por tienda ──────────────────────────────────────
 
-def fetch_all_tickets():
+def fetch_tickets_for_tienda(tienda_nombre, api_key):
+    """Jala todos los tickets de una tienda específica."""
+    if not api_key:
+        print(f"[WARN] Sin API key para {tienda_nombre}")
+        return tienda_nombre, []
+
     all_tickets = []
     page = 1
-    headers = {"Authorization": MGR_KEY.strip(), "Accept": "application/json"}
+    headers = {"Authorization": api_key.strip(), "Accept": "application/json"}
+
     while True:
         try:
             r = requests.get(f"{MGR_BASE}/tickets", headers=headers,
@@ -145,27 +114,44 @@ def fetch_all_tickets():
             batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
             if not batch:
                 break
+            # Inyectar tienda en cada ticket
+            for t in batch:
+                t["_tienda"] = tienda_nombre
             all_tickets.extend(batch)
             if len(batch) < 50:
                 break
             page += 1
-            time.sleep(0.5)
+            time.sleep(0.3)
         except Exception as e:
-            print(f"[ERROR] pág {page}: {e}")
+            print(f"[ERROR] {tienda_nombre} pág {page}: {e}")
             break
+
+    print(f"[INFO] {tienda_nombre}: {len(all_tickets)} tickets")
+    return tienda_nombre, all_tickets
+
+def fetch_all_tickets_parallel():
+    """Jala todas las tiendas en paralelo."""
+    all_tickets = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(fetch_tickets_for_tienda, nombre, key): nombre
+            for nombre, key in TIENDAS_CONFIG.items()
+            if key
+        }
+        for future in as_completed(futures):
+            tienda_nombre, tickets = future.result()
+            all_tickets.extend(tickets)
     return all_tickets
 
 # ── KPI compute ───────────────────────────────────────────
 
 def compute_kpis(tickets):
-    hoy_str = date.today().isoformat()   # "YYYY-MM-DD" en UTC-6 aprox.
+    hoy_str = date.today().isoformat()
     tiendas = {}
-
-    # Contadores de las 3 categorías (red completa)
-    cats = {"venta_limpia": [], "cobro_cartera": [], "pipeline_sin_cobrar": []}
+    cats    = {"venta_limpia": [], "cobro_cartera": [], "pipeline_sin_cobrar": []}
 
     for t in tickets:
-        tienda  = get_tienda(t)
+        tienda  = t.get("_tienda") or "Sin tienda"
         tecnico = get_tecnico_nombre(t)
         estado  = (t.get("status") or {}).get("label") or ""
         total   = parse_total(t)
@@ -186,9 +172,9 @@ def compute_kpis(tickets):
             }
 
         td = tiendas[tienda]
-        td["total"] += 1
+        td["total"]   += 1
         td["revenue"] += total
-        if cat in ("venta_limpia", "cobro_cartera", "pipeline_sin_cobrar"):
+        if cat in cats:
             td[cat] += 1
 
         if estado in EST_TERM:
@@ -198,13 +184,12 @@ def compute_kpis(tickets):
         elif estado in EST_ACT:
             td["wip"] += 1
 
-        real_tec = bool(tecnico)
-        if not real_tec:
-            td["boletos_sin_asignar"].append(
-                {"ref": ref, "estado": estado,
-                 "tipo": (t.get("issue_type") or {}).get("label") or "",
-                 "es_venta": venta}
-            )
+        if not tecnico:
+            td["boletos_sin_asignar"].append({
+                "ref": ref, "estado": estado,
+                "tipo": (t.get("issue_type") or {}).get("label") or "",
+                "es_venta": venta
+            })
             if venta:
                 td["sin_asignar_vta"] += 1
             else:
@@ -216,7 +201,7 @@ def compute_kpis(tickets):
                     "wip": 0, "revenue": 0.0, "cycle_times": []
                 }
             tec = td["tecnicos"][tecnico]
-            tec["total"] += 1
+            tec["total"]   += 1
             tec["revenue"] += total
             if estado in EST_TERM:
                 tec["completados"] += 1
@@ -225,7 +210,7 @@ def compute_kpis(tickets):
             elif estado in EST_ACT:
                 tec["wip"] += 1
 
-    # Promedios
+    # Promedios y orden
     for td in tiendas.values():
         cts = td.pop("cycle_times", [])
         td["cycle_time_avg_hrs"] = round(sum(cts)/len(cts), 1) if cts else None
@@ -243,71 +228,77 @@ def compute_kpis(tickets):
     sa_vta    = sum(td["sin_asignar_vta"] for td in tiendas.values())
     all_cts   = [td["cycle_time_avg_hrs"] for td in tiendas.values() if td["cycle_time_avg_hrs"]]
 
-    # Resumen de categorías del día
     def cat_summary(tlist):
-        rev = sum(parse_total(t) for t in tlist)
         return {
-            "count": len(tlist),
-            "revenue": round(rev, 2),
-            "por_tienda": _count_by_tienda(tlist)
+            "count":      len(tlist),
+            "revenue":    round(sum(parse_total(t) for t in tlist), 2),
+            "por_tienda": {
+                n: sum(1 for t in tlist if t.get("_tienda") == n)
+                for n in TIENDAS_CONFIG.keys()
+                if any(t.get("_tienda") == n for t in tlist)
+            }
         }
 
     return {
-        "hoy": hoy_str,
+        "hoy":    hoy_str,
         "red": {
-            "total": total_red, "completados": comp_red,
-            "wip": sum(td["wip"] for td in tiendas.values()),
-            "revenue": round(rev_red, 2),
-            "eficiencia": round(comp_red/total_red*100) if total_red > 0 else 0,
+            "total":              total_red,
+            "completados":        comp_red,
+            "wip":                sum(td["wip"] for td in tiendas.values()),
+            "revenue":            round(rev_red, 2),
+            "eficiencia":         round(comp_red/total_red*100) if total_red > 0 else 0,
             "cycle_time_avg_hrs": round(sum(all_cts)/len(all_cts), 1) if all_cts else None,
-            "sin_asignar_rep": sa_rep, "sin_asignar_vta": sa_vta,
+            "sin_asignar_rep":    sa_rep,
+            "sin_asignar_vta":    sa_vta,
         },
         "tiendas": list(tiendas.values()),
         "categorias_dia": {
-            "venta_limpia":         cat_summary(cats["venta_limpia"]),
-            "cobro_cartera":        cat_summary(cats["cobro_cartera"]),
-            "pipeline_sin_cobrar":  cat_summary(cats["pipeline_sin_cobrar"]),
+            "venta_limpia":        cat_summary(cats["venta_limpia"]),
+            "cobro_cartera":       cat_summary(cats["cobro_cartera"]),
+            "pipeline_sin_cobrar": cat_summary(cats["pipeline_sin_cobrar"]),
+        },
+        "tiendas_status": {
+            nombre: "ok" if key else "sin_key"
+            for nombre, key in TIENDAS_CONFIG.items()
         },
         "total_tickets_raw": len(tickets),
-        "updated_at": datetime.now(timezone.utc).isoformat()
+        "updated_at":        datetime.now(timezone.utc).isoformat()
     }
-
-def _count_by_tienda(tlist):
-    counts = {}
-    for t in tlist:
-        name = get_tienda(t)
-        counts[name] = counts.get(name, 0) + 1
-    return counts
 
 def get_kpis_cached():
     now = time.time()
     if _cache["data"] is None or (now - _cache["ts"]) > CACHE_TTL:
-        print("[INFO] Actualizando cache KPIs...")
-        tickets = fetch_all_tickets()
+        print("[INFO] Actualizando KPIs — jalando 5 tiendas...")
+        tickets = fetch_all_tickets_parallel()
         _cache["data"] = compute_kpis(tickets)
-        _cache["ts"] = now
-        print(f"[INFO] {len(tickets)} tickets procesados")
+        _cache["ts"]   = now
+        print(f"[INFO] Total: {len(tickets)} tickets de {len(TIENDAS_CONFIG)} tiendas")
     return _cache["data"]
 
 def get_all_cached():
     now = time.time()
     if _cache_all["data"] is None or (now - _cache_all["ts"]) > CACHE_TTL:
-        print("[INFO] Actualizando cache tickets/all...")
-        tickets = fetch_all_tickets()
+        print("[INFO] Actualizando tickets/all...")
+        tickets = fetch_all_tickets_parallel()
         _cache_all["data"] = tickets
-        _cache_all["ts"] = now
+        _cache_all["ts"]   = now
     return _cache_all["data"]
 
 # ── routes ────────────────────────────────────────────────
 
 @app.route("/")
 def health():
-    return jsonify({"status": "ok", "service": "Tatmon Producción API", "version": "3.0"})
+    keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
+    return jsonify({
+        "status":  "ok",
+        "service": "Tatmon Producción API",
+        "version": "4.0",
+        "tiendas_configuradas": keys_ok,
+        "tiendas": {n: "✓" if k else "✗ sin key" for n, k in TIENDAS_CONFIG.items()}
+    })
 
 @app.route("/kpis")
 def kpis():
-    if not MGR_KEY:
-        return jsonify({"error": "MGR_API_KEY no configurada"}), 500
     try:
         return jsonify(get_kpis_cached())
     except Exception as e:
@@ -315,22 +306,21 @@ def kpis():
 
 @app.route("/kpis/refresh")
 def refresh():
-    _cache["data"] = None
-    _cache["ts"]   = 0
+    _cache["data"]     = None
+    _cache["ts"]       = 0
     _cache_all["data"] = None
     _cache_all["ts"]   = 0
     data = get_kpis_cached()
-    return jsonify({"ok": True, "updated_at": data["updated_at"]})
+    return jsonify({"ok": True, "updated_at": data["updated_at"],
+                    "total_tickets": data["total_tickets_raw"]})
 
 @app.route("/tickets/all")
 def tickets_all():
-    if not MGR_KEY:
-        return jsonify({"error": "MGR_API_KEY no configurada"}), 500
     try:
         tickets = get_all_cached()
         return jsonify({
-            "tickets": tickets,
-            "total": len(tickets),
+            "tickets":    tickets,
+            "total":      len(tickets),
             "updated_at": datetime.now(timezone.utc).isoformat()
         })
     except Exception as e:
@@ -338,17 +328,25 @@ def tickets_all():
 
 @app.route("/tickets/raw")
 def tickets_raw():
-    if not MGR_KEY:
-        return jsonify({"error": "MGR_API_KEY no configurada"}), 500
-    headers = {"Authorization": MGR_KEY.strip(), "Accept": "application/json"}
-    try:
-        r = requests.get(f"{MGR_BASE}/tickets", headers=headers, timeout=15)
-        r.raise_for_status()
-        data   = r.json()
-        sample = data[:3] if isinstance(data, list) else (data.get("tickets") or [])[:3]
-        return jsonify({"sample": sample, "campos": list(sample[0].keys()) if sample else []})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    results = {}
+    for nombre, key in TIENDAS_CONFIG.items():
+        if not key:
+            results[nombre] = {"error": "sin key"}
+            continue
+        headers = {"Authorization": key.strip(), "Accept": "application/json"}
+        try:
+            r = requests.get(f"{MGR_BASE}/tickets", headers=headers, timeout=10)
+            data   = r.json()
+            sample = data[:1] if isinstance(data, list) else (data.get("tickets") or [])[:1]
+            results[nombre] = {
+                "status": r.status_code,
+                "count_pag1": len(data) if isinstance(data, list) else len(data.get("tickets") or []),
+                "campos": list(sample[0].keys()) if sample else [],
+                "invoice_sample": sample[0].get("invoice") if sample else None
+            }
+        except Exception as e:
+            results[nombre] = {"error": str(e)}
+    return jsonify(results)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
