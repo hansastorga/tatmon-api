@@ -42,10 +42,30 @@ def get_tienda(ticket):
     email = (tec.get("email") or "").lower().strip()
     if email in TIENDA_EMAIL_MAP:
         return TIENDA_EMAIL_MAP[email]
-    fname = (tec.get("first_name") or "").lower().strip()
-    for k, v in TIENDA_EMAIL_MAP.items():
-        if v.lower().replace("tatmon ", "") == fname.replace("tatmon ", ""):
-            return v
+    fname = (tec.get("first_name") or "").strip()
+    lname = (tec.get("last_name") or "").strip()
+    full  = f"{fname} {lname}".strip().lower()
+    # Match by first name containing tienda keyword
+    tienda_keywords = {
+        "cayalá": "Tatmon Cayalá", "cayala": "Tatmon Cayalá",
+        "kalú": "Tatmon Kalú",   "kalu": "Tatmon Kalú",
+        "villa": "Tatmon La Villa",
+        "quiché": "Tatmon Quiché", "quiche": "Tatmon Quiché",
+        "quetzaltenango": "Tatmon Quetzaltenango", "xela": "Tatmon Quetzaltenango",
+    }
+    for kw, name in tienda_keywords.items():
+        if kw in full:
+            return name
+    # If technician has no email and no recognizable name but has an id, mark as unassigned store
+    if not email and not fname:
+        return "Sin tienda"
+    # Real technician — determine tienda from ticket_ref prefix
+    ref = ticket.get("ticket_ref") or ""
+    ref_map = {"CY": "Tatmon Cayalá", "K": "Tatmon Kalú", "L": "Tatmon La Villa",
+               "CQ": "Tatmon Quiché", "Q": "Tatmon Quetzaltenango"}
+    for prefix, name in ref_map.items():
+        if ref.startswith(prefix + "-"):
+            return name
     return "Sin tienda"
 
 def get_tecnico_nombre(ticket):
@@ -63,9 +83,10 @@ def is_venta(ticket):
 
 def parse_total(ticket):
     inv = ticket.get("invoice") or {}
-    for key in ("total", "amount", "grand_total"):
+    # MGR /tickets list returns: invoice.amount (the paid amount)
+    for key in ("amount", "total", "grand_total", "subtotal"):
         v = inv.get(key)
-        if v:
+        if v is not None and v != "" and v != 0:
             try:
                 return float(str(v).replace("Q", "").replace(",", "").strip())
             except:
