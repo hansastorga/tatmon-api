@@ -253,3 +253,45 @@ def tickets_raw():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/tickets/all")
+def tickets_all():
+    """Devuelve todos los tickets para el dashboard (usado en timeline y tipos)."""
+    if not MGR_KEY:
+        return jsonify({"error": "MGR_API_KEY no configurada"}), 500
+    try:
+        all_t = fetch_all_tickets()
+        return jsonify({
+            "tickets": all_t,
+            "total": len(all_t),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/probe")
+def probe():
+    """Prueba qué endpoints existen en la API de MGR."""
+    if not MGR_KEY:
+        return jsonify({"error": "MGR_API_KEY no configurada"}), 500
+    headers = {"Authorization": MGR_KEY.strip(), "Accept": "application/json"}
+    endpoints = [
+        "invoices", "payments", "invoice", "payment",
+        "transactions", "receipts", "invoices/payments"
+    ]
+    results = {}
+    for ep in endpoints:
+        try:
+            r = requests.get(f"{MGR_BASE}/{ep}", headers=headers, timeout=8)
+            results[ep] = {"status": r.status_code, "ok": r.status_code in [200,201]}
+            if r.status_code == 200:
+                data = r.json()
+                sample = data if isinstance(data, list) else data
+                if isinstance(sample, list) and len(sample) > 0:
+                    results[ep]["campos"] = list(sample[0].keys())[:8]
+                elif isinstance(sample, dict):
+                    results[ep]["campos"] = list(sample.keys())[:8]
+            time.sleep(0.3)
+        except Exception as e:
+            results[ep] = {"status": "error", "msg": str(e)[:60]}
+    return jsonify(results)
