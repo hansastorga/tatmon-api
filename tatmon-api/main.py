@@ -45,7 +45,7 @@ def parse_total(s):
 def fetch_all_tickets():
     """Jala todos los tickets de MGR paginando de 50 en 50."""
     headers = {
-        "Authorization": MGR_KEY,
+        "Authorization": f"apiKey {MGR_KEY}",
         "Accept": "application/json"
     }
     all_tickets = []
@@ -228,7 +228,7 @@ def tickets_raw():
     """Devuelve los primeros 10 tickets en crudo para debug de campos."""
     if not MGR_KEY:
         return jsonify({"error": "MGR_API_KEY no configurada"}), 500
-    headers = {"Authorization": MGR_KEY, "Accept": "application/json"}
+    headers = {"Authorization": f"apiKey {MGR_KEY}", "Accept": "application/json"}
     try:
         r = requests.get(f"{MGR_BASE}/tickets", headers=headers, timeout=15)
         r.raise_for_status()
