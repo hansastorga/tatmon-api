@@ -107,7 +107,6 @@ def fetch_tickets_for_tienda(nombre, api_key):
     page = 1
     headers = {"Authorization": api_key.strip(), "Accept": "application/json"}
     desde = (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
-    consecutive_old = 0  # páginas consecutivas con todos los tickets fuera de ventana
     while True:
         try:
             r = requests.get(f"{MGR_BASE}/tickets", headers=headers,
@@ -117,24 +116,14 @@ def fetch_tickets_for_tienda(nombre, api_key):
             batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
             if not batch:
                 break
-            # Filtrar por ventana — pero siempre incluir tickets sin fecha
-            en_ventana = []
-            fuera = 0
+            # Inyectar tienda en todos sin filtrar aquí
             for t in batch:
-                fecha = date_str(t.get("created_date", ""))
-                if not fecha or fecha >= desde:
-                    t["_tienda"] = nombre
-                    en_ventana.append(t)
-                else:
-                    fuera += 1
-            all_tickets.extend(en_ventana)
-            # Parar solo si TODA la página está fuera de ventana (2 páginas consecutivas)
-            if fuera == len(batch):
-                consecutive_old += 1
-                if consecutive_old >= 2:
-                    break
-            else:
-                consecutive_old = 0
+                t["_tienda"] = nombre
+            all_tickets.extend(batch)
+            # Parar si el ticket más antiguo del batch ya está fuera de ventana
+            fechas = [date_str(t.get("created_date","")) for t in batch if t.get("created_date")]
+            if fechas and min(fechas) < desde:
+                break
             if len(batch) < 50:
                 break
             page += 1
@@ -142,8 +131,11 @@ def fetch_tickets_for_tienda(nombre, api_key):
         except Exception as e:
             print(f"[ERROR] {nombre} pág {page}: {e}")
             break
-    print(f"[INFO] {nombre}: {len(all_tickets)} tickets (ventana {DIAS_VENTANA}d, desde {desde})")
-    return nombre, all_tickets
+    # Filtrar por ventana DESPUÉS de recopilar
+    en_ventana = [t for t in all_tickets
+                  if not t.get("created_date") or date_str(t.get("created_date","")) >= desde]
+    print(f"[INFO] {nombre}: {len(en_ventana)}/{len(all_tickets)} tickets en ventana {DIAS_VENTANA}d")
+    return nombre, en_ventana
 
 def fetch_all_parallel():
     all_tickets = []
