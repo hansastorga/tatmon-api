@@ -349,19 +349,20 @@ def debug_tiendas():
             r = requests.get(f"{MGR_BASE}/tickets", headers=headers,
                              params={"page": 1}, timeout=10)
             data = r.json()
-            if isinstance(data, list):
-                batch = data
-            else:
-                batch = data.get("tickets") or data.get("data") or []
+            batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
             sample = batch[0] if batch else {}
+            # Mostrar fechas de todos los tickets del primer batch
+            fechas = [date_str(t.get("created_date","")) for t in batch]
             results[nombre] = {
                 "status":        r.status_code,
                 "count_pag1":    len(batch),
+                "primera_fecha": fechas[0] if fechas else None,
+                "ultima_fecha":  fechas[-1] if fechas else None,
+                "todas_fechas":  fechas,
                 "invoice_keys":  list((sample.get("invoice") or {}).keys()),
                 "invoice_sample": sample.get("invoice"),
                 "primer_ref":    sample.get("ticket_ref"),
-                "primer_fecha":  date_str(sample.get("created_date","")),
-                "primer_tec_email": (sample.get("technician") or {}).get("email"),
+                "ultimo_ref":    batch[-1].get("ticket_ref") if batch else None,
             }
         except Exception as e:
             results[nombre] = {"error": str(e)}
