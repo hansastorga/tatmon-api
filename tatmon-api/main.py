@@ -100,13 +100,12 @@ def dentro_ventana(ticket, desde_str):
 
 # ── fetch ─────────────────────────────────────────────────
 
-def fetch_tickets_for_tienda(nombre, api_key):
+def fetch_tickets_for_tienda_rango(nombre, api_key, desde_str, hasta_str):
     if not api_key:
         return nombre, []
     all_tickets = []
     page = 1
     headers = {"Authorization": api_key.strip(), "Accept": "application/json"}
-    desde = (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
     while True:
         try:
             r = requests.get(f"{MGR_BASE}/tickets", headers=headers,
@@ -116,42 +115,57 @@ def fetch_tickets_for_tienda(nombre, api_key):
             batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
             if not batch:
                 break
-            # Inyectar tienda en todos sin filtrar aquí
             for t in batch:
                 t["_tienda"] = nombre
             all_tickets.extend(batch)
-            # Parar si el ticket más antiguo del batch ya está fuera de ventana
             fechas = [date_str(t.get("created_date","")) for t in batch if t.get("created_date")]
-            if fechas and min(fechas) < desde:
+            if fechas and min(fechas) < desde_str:
                 break
             if len(batch) < 50:
                 break
             page += 1
             time.sleep(0.3)
         except Exception as e:
-            print(f"[ERROR] {nombre} pág {page}: {e}")
+            print(f"[ERROR] {nombre} pag {page}: {e}")
             break
-    # Filtrar por ventana DESPUÉS de recopilar
     en_ventana = [t for t in all_tickets
-                  if not t.get("created_date") or date_str(t.get("created_date","")) >= desde]
-    print(f"[INFO] {nombre}: {len(en_ventana)}/{len(all_tickets)} tickets en ventana {DIAS_VENTANA}d")
+                  if t.get("created_date") and
+                  desde_str <= date_str(t["created_date"]) <= hasta_str]
+    print(f"[INFO] {nombre}: {len(en_ventana)} tickets ({desde_str} to {hasta_str})")
     return nombre, en_ventana
 
-def fetch_all_parallel():
+def fetch_tickets_for_tienda(nombre, api_key):
+    _, tickets = fetch_tickets_for_tienda_rango(nombre, api_key,
+        (date.today() - timedelta(days=DIAS_VENTANA)).isoformat(),
+        date.today().isoformat())
+    return nombre, tickets
+
+def fetch_all_parallel(dias=None, desde=None, hasta=None):
+    # Calcular ventana efectiva
+    if desde and hasta:
+        desde_str = desde
+        hasta_str = hasta
+    else:
+        d = int(dias) if dias else DIAS_VENTANA
+        hasta_str = date.today().isoformat()
+        desde_str = (date.today() - timedelta(days=d)).isoformat()
+
     all_tickets = []
     with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = {ex.submit(fetch_tickets_for_tienda, n, k): n
+        futures = {ex.submit(fetch_tickets_for_tienda_rango, n, k, desde_str, hasta_str): n
                    for n, k in TIENDAS_CONFIG.items() if k}
         for f in as_completed(futures):
             _, tickets = f.result()
             all_tickets.extend(tickets)
-    return all_tickets
+    print(f"[INFO] Red completa: {len(all_tickets)} tickets ({desde_str} → {hasta_str})")
+    return all_tickets, desde_str, hasta_str
 
 # ── compute ───────────────────────────────────────────────
 
-def compute_kpis(tickets):
+def compute_kpis(tickets, desde_str=None, hasta_str=None):
     hoy_str  = date.today().isoformat()
-    desde    = (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
+    desde    = desde_str or (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
+    hasta    = hasta_str or hoy_str
     tiendas  = {}
     cats     = {"venta_limpia":[], "cobro_cartera":[], "pipeline_sin_cobrar":[]}
 
@@ -244,7 +258,7 @@ def compute_kpis(tickets):
 
     return {
         "hoy":       hoy_str,
-        "ventana":   f"últimos {DIAS_VENTANA} días (desde {desde})",
+        "ventana":   f"{desde} → {hasta or hoy_str}",
         "red": {
             "total":              total_red,
             "completados":        comp_red,
@@ -270,20 +284,27 @@ def compute_kpis(tickets):
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
-def get_kpis_cached():
+def get_kpis_cached(dias=None, desde=None, hasta=None):
+    # Si hay params de fecha, no usar cache — recalcular siempre
+    if dias or desde:
+        tickets, desde_str, hasta_str = fetch_all_parallel(dias=dias, desde=desde, hasta=hasta)
+        return compute_kpis(tickets, desde_str, hasta_str)
     now = time.time()
     if _cache["data"] is None or (now - _cache["ts"]) > CACHE_TTL:
-        print(f"[INFO] Jalando tickets (ventana {DIAS_VENTANA} días)...")
-        tickets = fetch_all_parallel()
-        _cache["data"] = compute_kpis(tickets)
+        print(f"[INFO] Jalando tickets (ventana {DIAS_VENTANA} dias)...")
+        tickets, desde_str, hasta_str = fetch_all_parallel()
+        _cache["data"] = compute_kpis(tickets, desde_str, hasta_str)
         _cache["ts"]   = now
         print(f"[INFO] Total: {len(tickets)} tickets")
     return _cache["data"]
 
-def get_all_cached():
+def get_all_cached(dias=None, desde=None, hasta=None):
+    if dias or desde:
+        tickets, _, _ = fetch_all_parallel(dias=dias, desde=desde, hasta=hasta)
+        return tickets
     now = time.time()
     if _cache_all["data"] is None or (now - _cache_all["ts"]) > CACHE_TTL:
-        tickets = fetch_all_parallel()
+        tickets, _, _ = fetch_all_parallel()
         _cache_all["data"] = tickets
         _cache_all["ts"]   = now
     return _cache_all["data"]
@@ -303,7 +324,10 @@ def health():
 @app.route("/kpis")
 def kpis():
     try:
-        return jsonify(get_kpis_cached())
+        dias  = request.args.get("dias")
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+        return jsonify(get_kpis_cached(dias=dias, desde=desde, hasta=hasta))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -323,7 +347,10 @@ def refresh():
 @app.route("/tickets/all")
 def tickets_all():
     try:
-        tickets = get_all_cached()
+        dias  = request.args.get("dias")
+        desde = request.args.get("desde")
+        hasta = request.args.get("hasta")
+        tickets = get_all_cached(dias=dias, desde=desde, hasta=hasta)
         return jsonify({"tickets": tickets, "total": len(tickets),
                         "updated_at": datetime.now(timezone.utc).isoformat()})
     except Exception as e:
