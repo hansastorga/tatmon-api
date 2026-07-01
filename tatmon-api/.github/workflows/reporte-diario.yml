@@ -1,0 +1,15 @@
+name: Reporte diario de ventas Tatmon
+
+on:
+  schedule:
+    # 03:00 UTC = 21:00 (9:00 PM) hora de Guatemala (UTC-6, sin horario de verano)
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  enviar-reporte:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disparar generación y envío del reporte
+        run: |
+          curl -sf "https://tatmon-api-production.up.railway.app/reporte/enviar?secret=${{ secrets.REPORT_SECRET }}"
