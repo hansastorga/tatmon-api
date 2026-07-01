@@ -1,8 +1,20 @@
-import os, time, requests
+import os, time, io, smtplib, requests
 from datetime import datetime, timezone, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, jsonify, request
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
+
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
 
 app = Flask(__name__)
 CORS(app)
@@ -31,6 +43,21 @@ DIAS_VENTANA = int(os.environ.get("DIAS_VENTANA", "30"))
 _cache     = {"data": None, "ts": 0}
 _cache_all = {"data": None, "ts": 0}
 CACHE_TTL  = 3600
+
+# ── Config del reporte diario por correo ────────────────────
+EMAIL_USER          = os.environ.get("EMAIL_USER", "")           # ej. ventas@tatmon.com
+EMAIL_APP_PASSWORD  = os.environ.get("EMAIL_APP_PASSWORD", "")   # Contraseña de aplicación de Google
+REPORT_RECIPIENTS   = [r.strip() for r in os.environ.get("REPORT_RECIPIENTS", "").split(",") if r.strip()]
+REPORT_SECRET        = os.environ.get("REPORT_SECRET", "")        # para proteger el endpoint de envío
+
+AZUL    = colors.HexColor("#00A7E1")
+NARANJA = colors.HexColor("#FF6B00")
+NEGRO   = colors.HexColor("#1A1A1A")
+GRIS    = colors.HexColor("#F2F2F2")
+VERDE   = colors.HexColor("#1E8E3E")
+ROJO    = colors.HexColor("#D93025")
+
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "logo.jpg")
 
 # ── helpers ──────────────────────────────────────────────
 
@@ -141,7 +168,6 @@ def fetch_tickets_for_tienda(nombre, api_key):
     return nombre, tickets
 
 def fetch_all_parallel(dias=None, desde=None, hasta=None):
-    # Calcular ventana efectiva
     if desde and hasta:
         desde_str = desde
         hasta_str = hasta
@@ -285,7 +311,6 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
     }
 
 def get_kpis_cached(dias=None, desde=None, hasta=None):
-    # Si hay params de fecha, no usar cache — recalcular siempre
     if dias or desde:
         tickets, desde_str, hasta_str = fetch_all_parallel(dias=dias, desde=desde, hasta=hasta)
         return compute_kpis(tickets, desde_str, hasta_str)
@@ -309,13 +334,169 @@ def get_all_cached(dias=None, desde=None, hasta=None):
         _cache_all["ts"]   = now
     return _cache_all["data"]
 
+def get_dia_kpis(fecha_str):
+    """KPIs de un solo día exacto (usado por el reporte diario)."""
+    tickets, desde_str, hasta_str = fetch_all_parallel(desde=fecha_str, hasta=fecha_str)
+    return compute_kpis(tickets, desde_str, hasta_str)
+
+# ── reporte diario: PDF ─────────────────────────────────────
+
+def fmt_q(valor):
+    return f"Q {valor:,.2f}"
+
+def generar_analisis(tiendas_hoy, tiendas_ayer, rev_hoy, rev_ayer, var_pct):
+    lineas = []
+    if rev_ayer == 0 and rev_hoy == 0:
+        lineas.append("Sin ventas registradas hoy ni ayer en la red.")
+        return lineas
+
+    tendencia = "creció" if var_pct >= 0 else "cayó"
+    lineas.append(f"La red {tendencia} {abs(var_pct):.1f}% respecto a ayer "
+                  f"({fmt_q(rev_ayer)} → {fmt_q(rev_hoy)}).")
+
+    if tiendas_hoy:
+        mejor = max(tiendas_hoy.values(), key=lambda t: t.get("revenue", 0))
+        peor  = min(tiendas_hoy.values(), key=lambda t: t.get("revenue", 0))
+        lineas.append(f"{mejor['nombre']} lideró el día con {fmt_q(mejor.get('revenue',0))}.")
+        if peor["nombre"] != mejor["nombre"]:
+            lineas.append(f"{peor['nombre']} tuvo el resultado más bajo con {fmt_q(peor.get('revenue',0))}.")
+
+    sin_hoy = [n for n in tiendas_ayer if n not in tiendas_hoy or tiendas_hoy[n].get("revenue",0)==0]
+    if sin_hoy:
+        lineas.append("Sin ventas registradas hoy en: " + ", ".join(sin_hoy) + ".")
+
+    return lineas
+
+def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter,
+                             topMargin=15*mm, bottomMargin=15*mm,
+                             leftMargin=15*mm, rightMargin=15*mm)
+    styles = getSampleStyleSheet()
+    elementos = []
+
+    if os.path.exists(LOGO_PATH):
+        elementos.append(Image(LOGO_PATH, width=55*mm, height=26.3*mm))
+        elementos.append(Spacer(1, 4*mm))
+
+    titulo_style = ParagraphStyle("titulo", parent=styles["Title"], textColor=NEGRO, fontSize=16)
+    elementos.append(Paragraph(f"Reporte Diario de Ventas — {fecha_str}", titulo_style))
+    elementos.append(Spacer(1, 6*mm))
+
+    rev_hoy  = data_hoy["red"]["revenue"]
+    rev_ayer = data_ayer["red"]["revenue"]
+    var_pct  = ((rev_hoy - rev_ayer) / rev_ayer * 100) if rev_ayer else (100.0 if rev_hoy else 0.0)
+    tickets_hoy = data_hoy["red"]["total"]
+
+    kpi_data = [
+        ["VENTAS HOY", "VENTAS AYER", "VARIACIÓN", "TICKETS HOY"],
+        [fmt_q(rev_hoy), fmt_q(rev_ayer), f"{var_pct:+.1f}%", str(tickets_hoy)],
+    ]
+    kpi_table = Table(kpi_data, colWidths=[42*mm]*4)
+    kpi_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), NEGRO),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTSIZE", (0,0), (-1,0), 8),
+        ("FONTSIZE", (0,1), (-1,1), 14),
+        ("FONTNAME", (0,1), (-1,1), "Helvetica-Bold"),
+        ("TEXTCOLOR", (2,1), (2,1), VERDE if var_pct >= 0 else ROJO),
+        ("ALIGN", (0,0), (-1,-1), "CENTER"),
+        ("BOTTOMPADDING", (0,0), (-1,0), 6),
+        ("TOPPADDING", (0,1), (-1,1), 8),
+        ("BOTTOMPADDING", (0,1), (-1,1), 8),
+        ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
+        ("LINEBELOW", (0,0), (-1,0), 0.5, colors.HexColor("#DDDDDD")),
+        ("BACKGROUND", (0,1), (-1,1), GRIS),
+    ]))
+    elementos.append(kpi_table)
+    elementos.append(Spacer(1, 8*mm))
+
+    subtitulo_style = ParagraphStyle("subtitulo", parent=styles["Heading2"], textColor=AZUL, fontSize=12)
+    elementos.append(Paragraph("Ventas por sucursal", subtitulo_style))
+    elementos.append(Spacer(1, 3*mm))
+
+    tiendas_hoy  = {t["nombre"]: t for t in data_hoy["tiendas"]}
+    tiendas_ayer = {t["nombre"]: t for t in data_ayer["tiendas"]}
+    nombres = sorted(set(TIENDAS_CONFIG) | set(tiendas_hoy) | set(tiendas_ayer))
+
+    tabla_data = [["Sucursal", "Hoy", "Ayer", "Variación"]]
+    filas_color = []
+    for i, nombre in enumerate(nombres, start=1):
+        rh = tiendas_hoy.get(nombre, {}).get("revenue", 0.0)
+        ra = tiendas_ayer.get(nombre, {}).get("revenue", 0.0)
+        var = ((rh - ra) / ra * 100) if ra else (100.0 if rh else 0.0)
+        tabla_data.append([nombre, fmt_q(rh), fmt_q(ra), f"{var:+.1f}%"])
+        filas_color.append((i, VERDE if var >= 0 else ROJO))
+
+    tabla = Table(tabla_data, colWidths=[70*mm, 35*mm, 35*mm, 30*mm])
+    estilo = [
+        ("BACKGROUND", (0,0), (-1,0), AZUL),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("ALIGN", (1,0), (-1,-1), "CENTER"),
+        ("GRID", (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, GRIS]),
+    ]
+    for fila, color in filas_color:
+        estilo.append(("TEXTCOLOR", (3,fila), (3,fila), color))
+        estilo.append(("FONTNAME", (3,fila), (3,fila), "Helvetica-Bold"))
+    tabla.setStyle(TableStyle(estilo))
+    elementos.append(tabla)
+    elementos.append(Spacer(1, 8*mm))
+
+    elementos.append(Paragraph("Análisis rápido", subtitulo_style))
+    elementos.append(Spacer(1, 3*mm))
+
+    analisis = generar_analisis(tiendas_hoy, tiendas_ayer, rev_hoy, rev_ayer, var_pct)
+    cuerpo_style = ParagraphStyle("cuerpo", parent=styles["Normal"], fontSize=10, leading=14)
+    for linea in analisis:
+        elementos.append(Paragraph(f"•  {linea}", cuerpo_style))
+        elementos.append(Spacer(1, 1.5*mm))
+
+    elementos.append(Spacer(1, 10*mm))
+    pie_style = ParagraphStyle("pie", parent=styles["Normal"], textColor=NARANJA,
+                                fontSize=9, alignment=TA_CENTER)
+    elementos.append(Paragraph("Te lo dejo ¡Niiiitiiiidoooo!", pie_style))
+
+    doc.build(elementos)
+    buf.seek(0)
+    return buf
+
+def enviar_reporte_email(pdf_buffer, fecha_str):
+    if not EMAIL_USER or not EMAIL_APP_PASSWORD:
+        raise RuntimeError("Faltan EMAIL_USER / EMAIL_APP_PASSWORD en variables de entorno")
+    if not REPORT_RECIPIENTS:
+        raise RuntimeError("REPORT_RECIPIENTS está vacío")
+
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_USER
+    msg["To"] = ", ".join(REPORT_RECIPIENTS)
+    msg["Subject"] = f"Reporte Diario de Ventas Tatmon — {fecha_str}"
+
+    cuerpo = ("Adjunto el reporte diario de ventas de Tatmon.\n\n"
+              "Generado automáticamente.\n\n"
+              "Te lo dejo ¡Niiiitiiiidoooo!")
+    msg.attach(MIMEText(cuerpo, "plain"))
+
+    adjunto = MIMEBase("application", "pdf")
+    adjunto.set_payload(pdf_buffer.read())
+    encoders.encode_base64(adjunto)
+    adjunto.add_header("Content-Disposition",
+                        f'attachment; filename="Reporte_Ventas_Tatmon_{fecha_str}.pdf"')
+    msg.attach(adjunto)
+
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_APP_PASSWORD)
+        server.send_message(msg)
+
 # ── routes ────────────────────────────────────────────────
 
 @app.route("/")
 def health():
     keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
     return jsonify({
-        "status": "ok", "service": "Tatmon API", "version": "4.1",
+        "status": "ok", "service": "Tatmon API", "version": "4.2",
         "tiendas_configuradas": keys_ok,
         "ventana_dias": DIAS_VENTANA,
         "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}
@@ -370,7 +551,6 @@ def debug_tiendas():
             data = r.json()
             batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
             sample = batch[0] if batch else {}
-            # Mostrar fechas de todos los tickets del primer batch
             fechas = [date_str(t.get("created_date","")) for t in batch]
             results[nombre] = {
                 "status":        r.status_code,
@@ -386,6 +566,36 @@ def debug_tiendas():
         except Exception as e:
             results[nombre] = {"error": str(e)}
     return jsonify(results)
+
+@app.route("/reporte/preview")
+def reporte_preview():
+    """Genera el PDF y lo devuelve directo en el navegador, sin enviar correo. Para probar."""
+    try:
+        hoy_str  = date.today().isoformat()
+        ayer_str = (date.today() - timedelta(days=1)).isoformat()
+        data_hoy  = get_dia_kpis(hoy_str)
+        data_ayer = get_dia_kpis(ayer_str)
+        pdf_buffer = generar_pdf_reporte(data_hoy, data_ayer, hoy_str)
+        return send_file(pdf_buffer, mimetype="application/pdf",
+                          as_attachment=False, download_name=f"reporte_{hoy_str}.pdf")
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/reporte/enviar")
+def reporte_enviar():
+    """Genera el PDF del día y lo envía por correo. Pensado para ser llamado por un cron externo."""
+    if REPORT_SECRET and request.args.get("secret") != REPORT_SECRET:
+        return jsonify({"ok": False, "error": "no autorizado"}), 401
+    try:
+        hoy_str  = date.today().isoformat()
+        ayer_str = (date.today() - timedelta(days=1)).isoformat()
+        data_hoy  = get_dia_kpis(hoy_str)
+        data_ayer = get_dia_kpis(ayer_str)
+        pdf_buffer = generar_pdf_reporte(data_hoy, data_ayer, hoy_str)
+        enviar_reporte_email(pdf_buffer, hoy_str)
+        return jsonify({"ok": True, "fecha": hoy_str, "destinatarios": REPORT_RECIPIENTS})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
