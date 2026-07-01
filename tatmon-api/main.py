@@ -57,7 +57,7 @@ GRIS    = colors.HexColor("#F2F2F2")
 VERDE   = colors.HexColor("#1E8E3E")
 ROJO    = colors.HexColor("#D93025")
 
-LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "logo.jpg")
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.jpg")
 
 # ── helpers ──────────────────────────────────────────────
 
