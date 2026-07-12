@@ -335,8 +335,7 @@ def get_all_cached(dias=None, desde=None, hasta=None):
     return _cache_all["data"]
 
 def get_dia_kpis(fecha_str):
-    """KPIs de un día: trae tickets de los últimos 90 días y filtra por fecha de PAGO.
-    Esto captura cobros de cartera (órdenes antiguas cobradas en esa fecha)."""
+    """KPIs de un día: trae tickets de los últimos 90 días y filtra por fecha de PAGO."""
     desde_90 = (date.fromisoformat(fecha_str) - timedelta(days=90)).isoformat()
     tickets, _, _ = fetch_all_parallel(desde=desde_90, hasta=fecha_str)
     tickets_del_dia = [
@@ -353,22 +352,18 @@ def generar_analisis(tiendas_hoy, tiendas_ayer, rev_hoy, rev_ayer, var_pct):
     if rev_ayer == 0 and rev_hoy == 0:
         lineas.append("Sin ventas registradas hoy ni ayer en la red.")
         return lineas
-
     tendencia = "creció" if var_pct >= 0 else "cayó"
     lineas.append(f"La red {tendencia} {abs(var_pct):.1f}% respecto a ayer "
                   f"({fmt_q(rev_ayer)} → {fmt_q(rev_hoy)}).")
-
     if tiendas_hoy:
         mejor = max(tiendas_hoy.values(), key=lambda t: t.get("revenue", 0))
         peor  = min(tiendas_hoy.values(), key=lambda t: t.get("revenue", 0))
         lineas.append(f"{mejor['nombre']} lideró el día con {fmt_q(mejor.get('revenue',0))}.")
         if peor["nombre"] != mejor["nombre"]:
             lineas.append(f"{peor['nombre']} tuvo el resultado más bajo con {fmt_q(peor.get('revenue',0))}.")
-
     sin_hoy = [n for n in tiendas_ayer if n not in tiendas_hoy or tiendas_hoy[n].get("revenue",0)==0]
     if sin_hoy:
         lineas.append("Sin ventas registradas hoy en: " + ", ".join(sin_hoy) + ".")
-
     return lineas
 
 def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
@@ -378,20 +373,16 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
                              leftMargin=15*mm, rightMargin=15*mm)
     styles = getSampleStyleSheet()
     elementos = []
-
     if os.path.exists(LOGO_PATH):
         elementos.append(Image(LOGO_PATH, width=55*mm, height=26.3*mm))
         elementos.append(Spacer(1, 4*mm))
-
     titulo_style = ParagraphStyle("titulo", parent=styles["Title"], textColor=NEGRO, fontSize=16)
     elementos.append(Paragraph(f"Reporte Diario de Ventas — {fecha_str}", titulo_style))
     elementos.append(Spacer(1, 6*mm))
-
     rev_hoy  = data_hoy["red"]["revenue"]
     rev_ayer = data_ayer["red"]["revenue"]
     var_pct  = ((rev_hoy - rev_ayer) / rev_ayer * 100) if rev_ayer else (100.0 if rev_hoy else 0.0)
     tickets_hoy = data_hoy["red"]["total"]
-
     kpi_data = [
         ["INGRESOS HOY", "INGRESOS AYER", "VARIACIÓN", "TICKETS HOY"],
         [fmt_q(rev_hoy), fmt_q(rev_ayer), f"{var_pct:+.1f}%", str(tickets_hoy)],
@@ -414,19 +405,14 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     ]))
     elementos.append(kpi_table)
     elementos.append(Spacer(1, 8*mm))
-
     subtitulo_style = ParagraphStyle("subtitulo", parent=styles["Heading2"], textColor=AZUL, fontSize=12)
-
-    # ── Desglose de ingresos ────────────────────────────────
     elementos.append(Paragraph("Desglose de ingresos", subtitulo_style))
     elementos.append(Spacer(1, 3*mm))
-
     cats_hoy     = data_hoy.get("categorias_dia", {})
     venta_hoy    = cats_hoy.get("venta_limpia",        {}).get("revenue", 0.0)
     cartera_hoy  = cats_hoy.get("cobro_cartera",       {}).get("revenue", 0.0)
     pipeline_hoy = cats_hoy.get("pipeline_sin_cobrar", {}).get("count",   0)
     realizado    = venta_hoy + cartera_hoy
-
     AMARILLO = colors.HexColor("#FFF8E1")
     desglose_data = [
         ["Categoría", "Monto", "Descripción"],
@@ -451,15 +437,11 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     ]))
     elementos.append(desglose_table)
     elementos.append(Spacer(1, 8*mm))
-
-    # ── Ventas por sucursal ──────────────────────────────
     elementos.append(Paragraph("Ingresos por sucursal", subtitulo_style))
     elementos.append(Spacer(1, 3*mm))
-
     tiendas_hoy  = {t["nombre"]: t for t in data_hoy["tiendas"]}
     tiendas_ayer = {t["nombre"]: t for t in data_ayer["tiendas"]}
     nombres = sorted(set(TIENDAS_CONFIG) | set(tiendas_hoy) | set(tiendas_ayer))
-
     tabla_data = [["Sucursal", "Hoy", "Ayer", "Variación"]]
     filas_color = []
     for i, nombre in enumerate(nombres, start=1):
@@ -468,7 +450,6 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
         var = ((rh - ra) / ra * 100) if ra else (100.0 if rh else 0.0)
         tabla_data.append([nombre, fmt_q(rh), fmt_q(ra), f"{var:+.1f}%"])
         filas_color.append((i, VERDE if var >= 0 else ROJO))
-
     tabla = Table(tabla_data, colWidths=[70*mm, 35*mm, 35*mm, 30*mm])
     estilo = [
         ("BACKGROUND", (0,0), (-1,0), AZUL),
@@ -484,22 +465,17 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     tabla.setStyle(TableStyle(estilo))
     elementos.append(tabla)
     elementos.append(Spacer(1, 8*mm))
-
-    # ── Análisis rápido ────────────────────────────────
     elementos.append(Paragraph("Análisis rápido", subtitulo_style))
     elementos.append(Spacer(1, 3*mm))
-
     analisis = generar_analisis(tiendas_hoy, tiendas_ayer, rev_hoy, rev_ayer, var_pct)
     cuerpo_style = ParagraphStyle("cuerpo", parent=styles["Normal"], fontSize=10, leading=14)
     for linea in analisis:
         elementos.append(Paragraph(f"•  {linea}", cuerpo_style))
         elementos.append(Spacer(1, 1.5*mm))
-
     elementos.append(Spacer(1, 10*mm))
     pie_style = ParagraphStyle("pie", parent=styles["Normal"], textColor=NARANJA,
                                 fontSize=9, alignment=TA_CENTER)
     elementos.append(Paragraph("Te lo dejo ¡Niiiitiiiidoooo!", pie_style))
-
     doc.build(elementos)
     buf.seek(0)
     return buf
@@ -509,24 +485,20 @@ def enviar_reporte_email(pdf_buffer, fecha_str):
         raise RuntimeError("Faltan EMAIL_USER / EMAIL_APP_PASSWORD en variables de entorno")
     if not REPORT_RECIPIENTS:
         raise RuntimeError("REPORT_RECIPIENTS está vacío")
-
     msg = MIMEMultipart()
     msg["From"] = EMAIL_USER
     msg["To"] = ", ".join(REPORT_RECIPIENTS)
     msg["Subject"] = f"Reporte Diario de Ventas Tatmon — {fecha_str}"
-
     cuerpo = ("Adjunto el reporte diario de ventas de Tatmon.\n\n"
               "Generado automáticamente.\n\n"
               "Te lo dejo ¡Niiiitiiiidoooo!")
     msg.attach(MIMEText(cuerpo, "plain"))
-
     adjunto = MIMEBase("application", "pdf")
     adjunto.set_payload(pdf_buffer.read())
     encoders.encode_base64(adjunto)
     adjunto.add_header("Content-Disposition",
                         f'attachment; filename="Reporte_Ventas_Tatmon_{fecha_str}.pdf"')
     msg.attach(adjunto)
-
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.starttls()
         server.login(EMAIL_USER, EMAIL_APP_PASSWORD)
@@ -536,7 +508,7 @@ def enviar_reporte_email(pdf_buffer, fecha_str):
 def health():
     keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
     return jsonify({
-        "status": "ok", "service": "Tatmon API", "version": "4.4",
+        "status": "ok", "service": "Tatmon API", "version": "4.5",
         "tiendas_configuradas": keys_ok,
         "ventana_dias": DIAS_VENTANA,
         "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}
@@ -609,10 +581,16 @@ def debug_tiendas():
 
 @app.route("/reporte/preview")
 def reporte_preview():
-    """Genera el PDF y lo devuelve directo en el navegador, sin enviar correo."""
+    """Genera el PDF y lo devuelve directo en el navegador, sin enviar correo.
+    Acepta ?fecha=YYYY-MM-DD para generar el reporte de un día específico."""
     try:
-        hoy_str  = date.today().isoformat()
-        ayer_str = (date.today() - timedelta(days=1)).isoformat()
+        fecha_param = request.args.get("fecha")
+        if fecha_param:
+            hoy_str  = fecha_param
+            ayer_str = (date.fromisoformat(fecha_param) - timedelta(days=1)).isoformat()
+        else:
+            hoy_str  = date.today().isoformat()
+            ayer_str = (date.today() - timedelta(days=1)).isoformat()
         data_hoy  = get_dia_kpis(hoy_str)
         data_ayer = get_dia_kpis(ayer_str)
         pdf_buffer = generar_pdf_reporte(data_hoy, data_ayer, hoy_str)
@@ -623,12 +601,18 @@ def reporte_preview():
 
 @app.route("/reporte/enviar")
 def reporte_enviar():
-    """Genera el PDF del día y lo envía por correo."""
+    """Genera el PDF del día y lo envía por correo.
+    Acepta ?fecha=YYYY-MM-DD para enviar el reporte de un día específico."""
     if REPORT_SECRET and request.args.get("secret") != REPORT_SECRET:
         return jsonify({"ok": False, "error": "no autorizado"}), 401
     try:
-        hoy_str  = date.today().isoformat()
-        ayer_str = (date.today() - timedelta(days=1)).isoformat()
+        fecha_param = request.args.get("fecha")
+        if fecha_param:
+            hoy_str  = fecha_param
+            ayer_str = (date.fromisoformat(fecha_param) - timedelta(days=1)).isoformat()
+        else:
+            hoy_str  = date.today().isoformat()
+            ayer_str = (date.today() - timedelta(days=1)).isoformat()
         data_hoy  = get_dia_kpis(hoy_str)
         data_ayer = get_dia_kpis(ayer_str)
         pdf_buffer = generar_pdf_reporte(data_hoy, data_ayer, hoy_str)
