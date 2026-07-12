@@ -37,18 +37,16 @@ EST_ACT  = {
     "Paquete del interior", "Esta en taller Ajeno", "Recolección"
 }
 
-# Solo mostramos tickets de los últimos N días
 DIAS_VENTANA = int(os.environ.get("DIAS_VENTANA", "30"))
 
 _cache     = {"data": None, "ts": 0}
 _cache_all = {"data": None, "ts": 0}
 CACHE_TTL  = 3600
 
-# ── Config del reporte diario por correo ────────────────────
-EMAIL_USER          = os.environ.get("EMAIL_USER", "")           # ej. ventas@tatmon.com
-EMAIL_APP_PASSWORD  = os.environ.get("EMAIL_APP_PASSWORD", "")   # Contraseña de aplicación de Google
+EMAIL_USER          = os.environ.get("EMAIL_USER", "")
+EMAIL_APP_PASSWORD  = os.environ.get("EMAIL_APP_PASSWORD", "")
 REPORT_RECIPIENTS   = [r.strip() for r in os.environ.get("REPORT_RECIPIENTS", "").split(",") if r.strip()]
-REPORT_SECRET        = os.environ.get("REPORT_SECRET", "")        # para proteger el endpoint de envío
+REPORT_SECRET        = os.environ.get("REPORT_SECRET", "")
 
 AZUL    = colors.HexColor("#00A7E1")
 NARANJA = colors.HexColor("#FF6B00")
@@ -58,8 +56,6 @@ VERDE   = colors.HexColor("#1E8E3E")
 ROJO    = colors.HexColor("#D93025")
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.jpg")
-
-# ── helpers ──────────────────────────────────────────────
 
 def get_tecnico_nombre(ticket):
     tec   = ticket.get("technician") or {}
@@ -90,6 +86,16 @@ def parse_total(ticket):
                     return f
             except:
                 pass
+    # MGR no trae monto en invoice — extraer de descripción del ticket
+    # Formato: "Precio pactado: Q400" o "Precio pactado: Q1,200.00"
+    import re
+    desc = ticket.get("description") or ""
+    m = re.search(r'[Pp]recio\s+pactado\s*:\s*Q?\s*([\d,]+(?:\.\d+)?)', desc)
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except:
+            pass
     return 0.0
 
 def date_str(iso):
@@ -124,8 +130,6 @@ def classify_ticket(ticket, hoy_str):
 def dentro_ventana(ticket, desde_str):
     creado = date_str(ticket.get("created_date", ""))
     return creado >= desde_str
-
-# ── fetch ─────────────────────────────────────────────────
 
 def fetch_tickets_for_tienda_rango(nombre, api_key, desde_str, hasta_str):
     if not api_key:
@@ -185,8 +189,6 @@ def fetch_all_parallel(dias=None, desde=None, hasta=None):
             all_tickets.extend(tickets)
     print(f"[INFO] Red completa: {len(all_tickets)} tickets ({desde_str} → {hasta_str})")
     return all_tickets, desde_str, hasta_str
-
-# ── compute ───────────────────────────────────────────────
 
 def compute_kpis(tickets, desde_str=None, hasta_str=None):
     hoy_str  = date.today().isoformat()
@@ -339,8 +341,6 @@ def get_dia_kpis(fecha_str):
     tickets, desde_str, hasta_str = fetch_all_parallel(desde=fecha_str, hasta=fecha_str)
     return compute_kpis(tickets, desde_str, hasta_str)
 
-# ── reporte diario: PDF ─────────────────────────────────────
-
 def fmt_q(valor):
     return f"Q {valor:,.2f}"
 
@@ -490,13 +490,11 @@ def enviar_reporte_email(pdf_buffer, fecha_str):
         server.login(EMAIL_USER, EMAIL_APP_PASSWORD)
         server.send_message(msg)
 
-# ── routes ────────────────────────────────────────────────
-
 @app.route("/")
 def health():
     keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
     return jsonify({
-        "status": "ok", "service": "Tatmon API", "version": "4.2",
+        "status": "ok", "service": "Tatmon API", "version": "4.3",
         "tiendas_configuradas": keys_ok,
         "ventana_dias": DIAS_VENTANA,
         "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}
@@ -569,7 +567,7 @@ def debug_tiendas():
 
 @app.route("/reporte/preview")
 def reporte_preview():
-    """Genera el PDF y lo devuelve directo en el navegador, sin enviar correo. Para probar."""
+    """Genera el PDF y lo devuelve directo en el navegador, sin enviar correo."""
     try:
         hoy_str  = date.today().isoformat()
         ayer_str = (date.today() - timedelta(days=1)).isoformat()
@@ -583,7 +581,7 @@ def reporte_preview():
 
 @app.route("/reporte/enviar")
 def reporte_enviar():
-    """Genera el PDF del día y lo envía por correo. Pensado para ser llamado por un cron externo."""
+    """Genera el PDF del día y lo envía por correo."""
     if REPORT_SECRET and request.args.get("secret") != REPORT_SECRET:
         return jsonify({"ok": False, "error": "no autorizado"}), 401
     try:
