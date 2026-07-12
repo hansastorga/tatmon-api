@@ -177,7 +177,6 @@ def fetch_all_parallel(dias=None, desde=None, hasta=None):
         d = int(dias) if dias else DIAS_VENTANA
         hasta_str = date.today().isoformat()
         desde_str = (date.today() - timedelta(days=d)).isoformat()
-
     all_tickets = []
     with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {ex.submit(fetch_tickets_for_tienda_rango, n, k, desde_str, hasta_str): n
@@ -194,7 +193,6 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
     hasta     = hasta_str or date.today().isoformat()
     tiendas   = {}
     cats      = {"venta_limpia":[], "cobro_cartera":[], "pipeline_sin_cobrar":[]}
-
     for t in tickets:
         tienda  = t.get("_tienda") or "Sin tienda"
         tecnico = get_tecnico_nombre(t)
@@ -204,10 +202,8 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
         venta   = is_venta(t)
         ref     = t.get("ticket_ref") or ""
         cat     = classify_ticket(t, fecha_ref)
-
         if cat in cats:
             cats[cat].append(t)
-
         if tienda not in tiendas:
             tiendas[tienda] = {
                 "nombre": tienda, "total": 0, "completados": 0, "wip": 0,
@@ -215,20 +211,17 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
                 "cycle_times": [], "tecnicos": {}, "boletos_sin_asignar": [],
                 "venta_limpia": 0, "cobro_cartera": 0, "pipeline_sin_cobrar": 0
             }
-
         td = tiendas[tienda]
         td["total"]   += 1
         td["revenue"] += total
         if cat in cats:
             td[cat] += 1
-
         if estado in EST_TERM:
             td["completados"] += 1
             if ct is not None:
                 td["cycle_times"].append(ct)
         elif estado in EST_ACT:
             td["wip"] += 1
-
         if not tecnico:
             td["boletos_sin_asignar"].append({
                 "ref": ref, "estado": estado,
@@ -254,7 +247,6 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
                     tec["cycle_times"].append(ct)
             elif estado in EST_ACT:
                 tec["wip"] += 1
-
     for td in tiendas.values():
         cts = td.pop("cycle_times", [])
         td["cycle_time_avg_hrs"] = round(sum(cts)/len(cts), 1) if cts else None
@@ -264,14 +256,12 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
             tec["cycle_time_avg_hrs"] = round(sum(tcts)/len(tcts), 1) if tcts else None
             tec["eficiencia"] = round(tec["completados"]/tec["total"]*100) if tec["total"] > 0 else 0
         td["tecnicos"] = sorted(td["tecnicos"].values(), key=lambda x: x["total"], reverse=True)
-
     total_red = sum(td["total"] for td in tiendas.values())
     comp_red  = sum(td["completados"] for td in tiendas.values())
     rev_red   = sum(td["revenue"] for td in tiendas.values())
     sa_rep    = sum(td["sin_asignar_rep"] for td in tiendas.values())
     sa_vta    = sum(td["sin_asignar_vta"] for td in tiendas.values())
     all_cts   = [td["cycle_time_avg_hrs"] for td in tiendas.values() if td["cycle_time_avg_hrs"]]
-
     def cat_sum(lst):
         return {
             "count":   len(lst),
@@ -281,7 +271,6 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
                 for n in TIENDAS_CONFIG if any(t.get("_tienda")==n for t in lst)
             }
         }
-
     return {
         "hoy":       fecha_ref,
         "ventana":   f"{desde} → {hasta}",
@@ -301,10 +290,7 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
             "cobro_cartera":       cat_sum(cats["cobro_cartera"]),
             "pipeline_sin_cobrar": cat_sum(cats["pipeline_sin_cobrar"]),
         },
-        "tiendas_status": {
-            n: "ok" if k else "sin_key"
-            for n, k in TIENDAS_CONFIG.items()
-        },
+        "tiendas_status": {n: "ok" if k else "sin_key" for n, k in TIENDAS_CONFIG.items()},
         "tiendas_activas": [n for n, k in TIENDAS_CONFIG.items() if k],
         "total_tickets_raw": len(tickets),
         "updated_at": datetime.now(timezone.utc).isoformat()
@@ -316,11 +302,9 @@ def get_kpis_cached(dias=None, desde=None, hasta=None):
         return compute_kpis(tickets, desde_str, hasta_str)
     now = time.time()
     if _cache["data"] is None or (now - _cache["ts"]) > CACHE_TTL:
-        print(f"[INFO] Jalando tickets (ventana {DIAS_VENTANA} dias)...")
         tickets, desde_str, hasta_str = fetch_all_parallel()
         _cache["data"] = compute_kpis(tickets, desde_str, hasta_str)
         _cache["ts"]   = now
-        print(f"[INFO] Total: {len(tickets)} tickets")
     return _cache["data"]
 
 def get_all_cached(dias=None, desde=None, hasta=None):
@@ -335,7 +319,6 @@ def get_all_cached(dias=None, desde=None, hasta=None):
     return _cache_all["data"]
 
 def get_dia_kpis(fecha_str):
-    """KPIs de un día: trae tickets de los últimos 90 días y filtra por fecha de PAGO."""
     desde_90 = (date.fromisoformat(fecha_str) - timedelta(days=90)).isoformat()
     tickets, _, _ = fetch_all_parallel(desde=desde_90, hasta=fecha_str)
     tickets_del_dia = [
@@ -353,8 +336,7 @@ def generar_analisis(tiendas_hoy, tiendas_ayer, rev_hoy, rev_ayer, var_pct):
         lineas.append("Sin ventas registradas hoy ni ayer en la red.")
         return lineas
     tendencia = "creció" if var_pct >= 0 else "cayó"
-    lineas.append(f"La red {tendencia} {abs(var_pct):.1f}% respecto a ayer "
-                  f"({fmt_q(rev_ayer)} → {fmt_q(rev_hoy)}).")
+    lineas.append(f"La red {tendencia} {abs(var_pct):.1f}% respecto a ayer ({fmt_q(rev_ayer)} → {fmt_q(rev_hoy)}).")
     if tiendas_hoy:
         mejor = max(tiendas_hoy.values(), key=lambda t: t.get("revenue", 0))
         peor  = min(tiendas_hoy.values(), key=lambda t: t.get("revenue", 0))
@@ -368,9 +350,7 @@ def generar_analisis(tiendas_hoy, tiendas_ayer, rev_hoy, rev_ayer, var_pct):
 
 def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter,
-                             topMargin=15*mm, bottomMargin=15*mm,
-                             leftMargin=15*mm, rightMargin=15*mm)
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=15*mm, bottomMargin=15*mm, leftMargin=15*mm, rightMargin=15*mm)
     styles = getSampleStyleSheet()
     elementos = []
     if os.path.exists(LOGO_PATH):
@@ -389,15 +369,12 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     ]
     kpi_table = Table(kpi_data, colWidths=[42*mm]*4)
     kpi_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), NEGRO),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTSIZE", (0,0), (-1,0), 8),
-        ("FONTSIZE", (0,1), (-1,1), 14),
+        ("BACKGROUND", (0,0), (-1,0), NEGRO), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTSIZE", (0,0), (-1,0), 8), ("FONTSIZE", (0,1), (-1,1), 14),
         ("FONTNAME", (0,1), (-1,1), "Helvetica-Bold"),
         ("TEXTCOLOR", (2,1), (2,1), VERDE if var_pct >= 0 else ROJO),
         ("ALIGN", (0,0), (-1,-1), "CENTER"),
-        ("BOTTOMPADDING", (0,0), (-1,0), 6),
-        ("TOPPADDING", (0,1), (-1,1), 8),
+        ("BOTTOMPADDING", (0,0), (-1,0), 6), ("TOPPADDING", (0,1), (-1,1), 8),
         ("BOTTOMPADDING", (0,1), (-1,1), 8),
         ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
         ("LINEBELOW", (0,0), (-1,0), 0.5, colors.HexColor("#DDDDDD")),
@@ -423,17 +400,13 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     ]
     desglose_table = Table(desglose_data, colWidths=[52*mm, 33*mm, 85*mm])
     desglose_table.setStyle(TableStyle([
-        ("BACKGROUND",     (0,0), (-1,0),  NEGRO),
-        ("TEXTCOLOR",      (0,0), (-1,0),  colors.white),
-        ("FONTNAME",       (0,0), (-1,0),  "Helvetica-Bold"),
-        ("FONTSIZE",       (0,0), (-1,-1), 9),
-        ("ALIGN",          (1,0), (1,-1),  "RIGHT"),
-        ("GRID",           (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
-        ("ROWBACKGROUNDS", (0,1), (-1,2),  [colors.white, GRIS]),
-        ("BACKGROUND",     (0,3), (-1,3),  AMARILLO),
-        ("FONTNAME",       (0,3), (-1,3),  "Helvetica-Bold"),
-        ("BACKGROUND",     (0,4), (-1,4),  GRIS),
-        ("TEXTCOLOR",      (0,4), (-1,4),  colors.HexColor("#888888")),
+        ("BACKGROUND", (0,0), (-1,0), NEGRO), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("ALIGN", (1,0), (1,-1), "RIGHT"),
+        ("GRID", (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
+        ("ROWBACKGROUNDS", (0,1), (-1,2), [colors.white, GRIS]),
+        ("BACKGROUND", (0,3), (-1,3), AMARILLO), ("FONTNAME", (0,3), (-1,3), "Helvetica-Bold"),
+        ("BACKGROUND", (0,4), (-1,4), GRIS), ("TEXTCOLOR", (0,4), (-1,4), colors.HexColor("#888888")),
     ]))
     elementos.append(desglose_table)
     elementos.append(Spacer(1, 8*mm))
@@ -452,10 +425,8 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
         filas_color.append((i, VERDE if var >= 0 else ROJO))
     tabla = Table(tabla_data, colWidths=[70*mm, 35*mm, 35*mm, 30*mm])
     estilo = [
-        ("BACKGROUND", (0,0), (-1,0), AZUL),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("ALIGN", (1,0), (-1,-1), "CENTER"),
+        ("BACKGROUND", (0,0), (-1,0), AZUL), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("ALIGN", (1,0), (-1,-1), "CENTER"),
         ("GRID", (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
         ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, GRIS]),
     ]
@@ -473,8 +444,7 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
         elementos.append(Paragraph(f"•  {linea}", cuerpo_style))
         elementos.append(Spacer(1, 1.5*mm))
     elementos.append(Spacer(1, 10*mm))
-    pie_style = ParagraphStyle("pie", parent=styles["Normal"], textColor=NARANJA,
-                                fontSize=9, alignment=TA_CENTER)
+    pie_style = ParagraphStyle("pie", parent=styles["Normal"], textColor=NARANJA, fontSize=9, alignment=TA_CENTER)
     elementos.append(Paragraph("Te lo dejo ¡Niiiitiiiidoooo!", pie_style))
     doc.build(elementos)
     buf.seek(0)
@@ -482,22 +452,18 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
 
 def enviar_reporte_email(pdf_buffer, fecha_str):
     if not EMAIL_USER or not EMAIL_APP_PASSWORD:
-        raise RuntimeError("Faltan EMAIL_USER / EMAIL_APP_PASSWORD en variables de entorno")
+        raise RuntimeError("Faltan EMAIL_USER / EMAIL_APP_PASSWORD")
     if not REPORT_RECIPIENTS:
-        raise RuntimeError("REPORT_RECIPIENTS está vacío")
+        raise RuntimeError("REPORT_RECIPIENTS vacío")
     msg = MIMEMultipart()
     msg["From"] = EMAIL_USER
     msg["To"] = ", ".join(REPORT_RECIPIENTS)
     msg["Subject"] = f"Reporte Diario de Ventas Tatmon — {fecha_str}"
-    cuerpo = ("Adjunto el reporte diario de ventas de Tatmon.\n\n"
-              "Generado automáticamente.\n\n"
-              "Te lo dejo ¡Niiiitiiiidoooo!")
-    msg.attach(MIMEText(cuerpo, "plain"))
+    msg.attach(MIMEText("Adjunto reporte diario.\n\nTe lo dejo ¡Niiiitiiiidoooo!", "plain"))
     adjunto = MIMEBase("application", "pdf")
     adjunto.set_payload(pdf_buffer.read())
     encoders.encode_base64(adjunto)
-    adjunto.add_header("Content-Disposition",
-                        f'attachment; filename="Reporte_Ventas_Tatmon_{fecha_str}.pdf"')
+    adjunto.add_header("Content-Disposition", f'attachment; filename="Reporte_Ventas_Tatmon_{fecha_str}.pdf"')
     msg.attach(adjunto)
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.starttls()
@@ -507,20 +473,14 @@ def enviar_reporte_email(pdf_buffer, fecha_str):
 @app.route("/")
 def health():
     keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
-    return jsonify({
-        "status": "ok", "service": "Tatmon API", "version": "4.5",
-        "tiendas_configuradas": keys_ok,
-        "ventana_dias": DIAS_VENTANA,
-        "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}
-    })
+    return jsonify({"status": "ok", "service": "Tatmon API", "version": "4.6-debug",
+                    "tiendas_configuradas": keys_ok, "ventana_dias": DIAS_VENTANA,
+                    "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}})
 
 @app.route("/kpis")
 def kpis():
     try:
-        dias  = request.args.get("dias")
-        desde = request.args.get("desde")
-        hasta = request.args.get("hasta")
-        return jsonify(get_kpis_cached(dias=dias, desde=desde, hasta=hasta))
+        return jsonify(get_kpis_cached(dias=request.args.get("dias"), desde=request.args.get("desde"), hasta=request.args.get("hasta")))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -529,23 +489,14 @@ def refresh():
     _cache["data"] = _cache_all["data"] = None
     _cache["ts"]   = _cache_all["ts"]   = 0
     data = get_kpis_cached()
-    return jsonify({
-        "ok": True,
-        "total_tickets": data["total_tickets_raw"],
-        "ventana": data["ventana"],
-        "tiendas_activas": data["tiendas_activas"],
-        "updated_at": data["updated_at"]
-    })
+    return jsonify({"ok": True, "total_tickets": data["total_tickets_raw"], "ventana": data["ventana"],
+                    "tiendas_activas": data["tiendas_activas"], "updated_at": data["updated_at"]})
 
 @app.route("/tickets/all")
 def tickets_all():
     try:
-        dias  = request.args.get("dias")
-        desde = request.args.get("desde")
-        hasta = request.args.get("hasta")
-        tickets = get_all_cached(dias=dias, desde=desde, hasta=hasta)
-        return jsonify({"tickets": tickets, "total": len(tickets),
-                        "updated_at": datetime.now(timezone.utc).isoformat()})
+        tickets = get_all_cached(dias=request.args.get("dias"), desde=request.args.get("desde"), hasta=request.args.get("hasta"))
+        return jsonify({"tickets": tickets, "total": len(tickets), "updated_at": datetime.now(timezone.utc).isoformat()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -558,22 +509,46 @@ def debug_tiendas():
             continue
         headers = {"Authorization": key.strip(), "Accept": "application/json"}
         try:
-            r = requests.get(f"{MGR_BASE}/tickets", headers=headers,
-                             params={"page": 1}, timeout=10)
+            r = requests.get(f"{MGR_BASE}/tickets", headers=headers, params={"page": 1}, timeout=10)
             data = r.json()
             batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
             sample = batch[0] if batch else {}
             fechas = [date_str(t.get("created_date","")) for t in batch]
+            results[nombre] = {"status": r.status_code, "count_pag1": len(batch),
+                "primera_fecha": fechas[0] if fechas else None, "ultima_fecha": fechas[-1] if fechas else None,
+                "todas_fechas": fechas, "invoice_keys": list((sample.get("invoice") or {}).keys()),
+                "invoice_sample": sample.get("invoice"), "primer_ref": sample.get("ticket_ref"),
+                "ultimo_ref": batch[-1].get("ticket_ref") if batch else None}
+        except Exception as e:
+            results[nombre] = {"error": str(e)}
+    return jsonify(results)
+
+@app.route("/debug/payments")
+def debug_payments():
+    """Explora el endpoint /payments de MGR. Acepta ?fecha=YYYY-MM-DD"""
+    fecha = request.args.get("fecha", "2026-07-11")
+    results = {}
+    for nombre, key in TIENDAS_CONFIG.items():
+        if not key:
+            results[nombre] = {"error": "sin key"}
+            continue
+        headers = {"Authorization": key.strip(), "Accept": "application/json"}
+        try:
+            # Probar sin filtro primero para ver estructura completa
+            r = requests.get(f"{MGR_BASE}/payments", headers=headers,
+                             params={"page": 1}, timeout=15)
+            data = r.json()
+            batch = data if isinstance(data, list) else (data.get("payments") or data.get("data") or [])
+            sample = batch[0] if batch else {}
+            # Filtrar por fecha localmente para ver cuantos hay
+            del_dia = [p for p in batch if fecha in str(p.get("created_at","") or p.get("date","") or p.get("payment_date","") or "")]
             results[nombre] = {
-                "status":        r.status_code,
-                "count_pag1":    len(batch),
-                "primera_fecha": fechas[0] if fechas else None,
-                "ultima_fecha":  fechas[-1] if fechas else None,
-                "todas_fechas":  fechas,
-                "invoice_keys":  list((sample.get("invoice") or {}).keys()),
-                "invoice_sample": sample.get("invoice"),
-                "primer_ref":    sample.get("ticket_ref"),
-                "ultimo_ref":    batch[-1].get("ticket_ref") if batch else None,
+                "status":       r.status_code,
+                "total_pag1":   len(batch),
+                "del_dia":      len(del_dia),
+                "keys":         list(sample.keys()) if sample else [],
+                "sample":       sample,
+                "raw_type":     "array" if isinstance(data, list) else list(data.keys()),
             }
         except Exception as e:
             results[nombre] = {"error": str(e)}
@@ -581,8 +556,7 @@ def debug_tiendas():
 
 @app.route("/reporte/preview")
 def reporte_preview():
-    """Genera el PDF y lo devuelve directo en el navegador, sin enviar correo.
-    Acepta ?fecha=YYYY-MM-DD para generar el reporte de un día específico."""
+    """Genera el PDF sin enviar. Acepta ?fecha=YYYY-MM-DD"""
     try:
         fecha_param = request.args.get("fecha")
         if fecha_param:
@@ -601,8 +575,7 @@ def reporte_preview():
 
 @app.route("/reporte/enviar")
 def reporte_enviar():
-    """Genera el PDF del día y lo envía por correo.
-    Acepta ?fecha=YYYY-MM-DD para enviar el reporte de un día específico."""
+    """Genera y envía el PDF por correo. Acepta ?fecha=YYYY-MM-DD"""
     if REPORT_SECRET and request.args.get("secret") != REPORT_SECRET:
         return jsonify({"ok": False, "error": "no autorizado"}), 401
     try:
