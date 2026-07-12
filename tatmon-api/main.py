@@ -325,9 +325,17 @@ def get_dia_kpis(fecha_str):
         "count":   sum(v["count"] for v in payments.values() if v["advances"] > 0),
         "revenue": round(total_advances, 2)
     }
-    kpis["_tickets_raw"] = tickets_del_dia
+    # Para categorización: incluir tickets de venta creados ese día
+    # aunque no tengan last_payment_date en el invoice
+    tickets_venta_dia = [
+        t for t in tickets
+        if date_str(t.get("created_date", "")) == fecha_str
+        and ((t.get("issue_type") or {}).get("label") or "").strip() == "Venta de equipos."
+    ]
+    ids_ya = {t.get("id") for t in tickets_del_dia}
+    tickets_extra = [t for t in tickets_venta_dia if t.get("id") not in ids_ya]
+    kpis["_tickets_raw"] = tickets_del_dia + tickets_extra
     return kpis
-
 def fmt_q(valor): return f"Q {valor:,.2f}"
 
 def categorizar_tickets_dia(tickets, fecha_str):
