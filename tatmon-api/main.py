@@ -38,7 +38,6 @@ EST_ACT  = {
 }
 
 DIAS_VENTANA = int(os.environ.get("DIAS_VENTANA", "30"))
-
 _cache     = {"data": None, "ts": 0}
 _cache_all = {"data": None, "ts": 0}
 CACHE_TTL  = 3600
@@ -46,7 +45,7 @@ CACHE_TTL  = 3600
 EMAIL_USER          = os.environ.get("EMAIL_USER", "")
 EMAIL_APP_PASSWORD  = os.environ.get("EMAIL_APP_PASSWORD", "")
 REPORT_RECIPIENTS   = [r.strip() for r in os.environ.get("REPORT_RECIPIENTS", "").split(",") if r.strip()]
-REPORT_SECRET        = os.environ.get("REPORT_SECRET", "")
+REPORT_SECRET       = os.environ.get("REPORT_SECRET", "")
 
 AZUL    = colors.HexColor("#00A7E1")
 NARANJA = colors.HexColor("#FF6B00")
@@ -63,12 +62,9 @@ def get_tecnico_nombre(ticket):
     fname = (tec.get("first_name") or "").strip()
     lname = (tec.get("last_name") or "").strip()
     full  = f"{fname} {lname}".strip()
-    tienda_kw = ["cayalá","cayala","kalú","kalu","villa","quiché",
-                 "quiche","quetzaltenango","xela","tatmon"]
-    if any(kw in email for kw in tienda_kw):
-        return ""
-    if full.lower().startswith("tatmon"):
-        return ""
+    tienda_kw = ["cayalá","cayala","kalú","kalu","villa","quiché","quiche","quetzaltenango","xela","tatmon"]
+    if any(kw in email for kw in tienda_kw): return ""
+    if full.lower().startswith("tatmon"): return ""
     return full
 
 def is_venta(ticket):
@@ -82,97 +78,76 @@ def parse_total(ticket):
         if v is not None and v != "":
             try:
                 f = float(str(v).replace("Q","").replace(",","").strip())
-                if f > 0:
-                    return f
-            except:
-                pass
+                if f > 0: return f
+            except: pass
     import re
     desc = ticket.get("description") or ""
     m = re.search(r'[Pp]recio\s+pactado\s*:\s*Q?\s*([\d,]+(?:\.\d+)?)', desc)
     if m:
-        try:
-            return float(m.group(1).replace(",", ""))
-        except:
-            pass
+        try: return float(m.group(1).replace(",", ""))
+        except: pass
     return 0.0
 
-def date_str(iso):
-    return str(iso or "")[:10]
+def date_str(iso): return str(iso or "")[:10]
 
 def cycle_time_hours(ticket):
     estado = (ticket.get("status") or {}).get("label") or ""
-    if estado not in EST_TERM:
-        return None
+    if estado not in EST_TERM: return None
     try:
         fmt = "%Y-%m-%dT%H:%M:%S%z"
         c = datetime.strptime(ticket["created_date"], fmt)
         u = datetime.strptime(ticket["last_updated"],  fmt)
         diff = (u - c).total_seconds() / 3600
         return round(diff, 1) if 0 < diff < 720 else None
-    except:
-        return None
+    except: return None
 
 def classify_ticket(ticket, fecha_str):
     creado = date_str(ticket.get("created_date", ""))
     inv    = ticket.get("invoice") or {}
     pagado = date_str(inv.get("last_payment_date", ""))
     paid   = bool(pagado)
-    if creado == fecha_str and paid and pagado == fecha_str:
-        return "venta_limpia"
-    elif creado < fecha_str and paid and pagado == fecha_str:
-        return "cobro_cartera"
-    elif creado == fecha_str and not paid:
-        return "pipeline_sin_cobrar"
+    if creado == fecha_str and paid and pagado == fecha_str: return "venta_limpia"
+    elif creado < fecha_str and paid and pagado == fecha_str: return "cobro_cartera"
+    elif creado == fecha_str and not paid: return "pipeline_sin_cobrar"
     return "otro"
 
 def dentro_ventana(ticket, desde_str):
-    creado = date_str(ticket.get("created_date", ""))
-    return creado >= desde_str
+    return date_str(ticket.get("created_date", "")) >= desde_str
 
 def fetch_tickets_for_tienda_rango(nombre, api_key, desde_str, hasta_str):
-    if not api_key:
-        return nombre, []
+    if not api_key: return nombre, []
     all_tickets = []
     page = 1
     headers = {"Authorization": api_key.strip(), "Accept": "application/json"}
     while True:
         try:
-            r = requests.get(f"{MGR_BASE}/tickets", headers=headers,
-                             params={"page": page}, timeout=15)
+            r = requests.get(f"{MGR_BASE}/tickets", headers=headers, params={"page": page}, timeout=15)
             r.raise_for_status()
             data  = r.json()
             batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
-            if not batch:
-                break
-            for t in batch:
-                t["_tienda"] = nombre
+            if not batch: break
+            for t in batch: t["_tienda"] = nombre
             all_tickets.extend(batch)
             fechas = [date_str(t.get("created_date","")) for t in batch if t.get("created_date")]
-            if fechas and min(fechas) < desde_str:
-                break
-            if len(batch) < 50:
-                break
+            if fechas and min(fechas) < desde_str: break
+            if len(batch) < 50: break
             page += 1
             time.sleep(0.3)
         except Exception as e:
             print(f"[ERROR] {nombre} pag {page}: {e}")
             break
-    en_ventana = [t for t in all_tickets
-                  if t.get("created_date") and
-                  desde_str <= date_str(t["created_date"]) <= hasta_str]
+    en_ventana = [t for t in all_tickets if t.get("created_date") and desde_str <= date_str(t["created_date"]) <= hasta_str]
     print(f"[INFO] {nombre}: {len(en_ventana)} tickets ({desde_str} to {hasta_str})")
     return nombre, en_ventana
 
 def fetch_tickets_for_tienda(nombre, api_key):
     _, tickets = fetch_tickets_for_tienda_rango(nombre, api_key,
-        (date.today() - timedelta(days=DIAS_VENTANA)).isoformat(),
-        date.today().isoformat())
+        (date.today() - timedelta(days=DIAS_VENTANA)).isoformat(), date.today().isoformat())
     return nombre, tickets
 
 def fetch_all_parallel(dias=None, desde=None, hasta=None):
     if desde and hasta:
-        desde_str = desde
-        hasta_str = hasta
+        desde_str = desde; hasta_str = hasta
     else:
         d = int(dias) if dias else DIAS_VENTANA
         hasta_str = date.today().isoformat()
@@ -202,51 +177,34 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
         venta   = is_venta(t)
         ref     = t.get("ticket_ref") or ""
         cat     = classify_ticket(t, fecha_ref)
-        if cat in cats:
-            cats[cat].append(t)
+        if cat in cats: cats[cat].append(t)
         if tienda not in tiendas:
-            tiendas[tienda] = {
-                "nombre": tienda, "total": 0, "completados": 0, "wip": 0,
+            tiendas[tienda] = {"nombre": tienda, "total": 0, "completados": 0, "wip": 0,
                 "revenue": 0.0, "sin_asignar_rep": 0, "sin_asignar_vta": 0,
                 "cycle_times": [], "tecnicos": {}, "boletos_sin_asignar": [],
-                "venta_limpia": 0, "cobro_cartera": 0, "pipeline_sin_cobrar": 0
-            }
+                "venta_limpia": 0, "cobro_cartera": 0, "pipeline_sin_cobrar": 0}
         td = tiendas[tienda]
-        td["total"]   += 1
-        td["revenue"] += total
-        if cat in cats:
-            td[cat] += 1
+        td["total"] += 1; td["revenue"] += total
+        if cat in cats: td[cat] += 1
         if estado in EST_TERM:
             td["completados"] += 1
-            if ct is not None:
-                td["cycle_times"].append(ct)
-        elif estado in EST_ACT:
-            td["wip"] += 1
+            if ct is not None: td["cycle_times"].append(ct)
+        elif estado in EST_ACT: td["wip"] += 1
         if not tecnico:
-            td["boletos_sin_asignar"].append({
-                "ref": ref, "estado": estado,
-                "tipo": (t.get("issue_type") or {}).get("label") or "",
-                "es_venta": venta
-            })
-            if venta:
-                td["sin_asignar_vta"] += 1
-            else:
-                td["sin_asignar_rep"] += 1
+            td["boletos_sin_asignar"].append({"ref": ref, "estado": estado,
+                "tipo": (t.get("issue_type") or {}).get("label") or "", "es_venta": venta})
+            if venta: td["sin_asignar_vta"] += 1
+            else:     td["sin_asignar_rep"] += 1
         else:
             if tecnico not in td["tecnicos"]:
-                td["tecnicos"][tecnico] = {
-                    "nombre": tecnico, "total": 0, "completados": 0,
-                    "wip": 0, "revenue": 0.0, "cycle_times": []
-                }
+                td["tecnicos"][tecnico] = {"nombre": tecnico, "total": 0, "completados": 0,
+                    "wip": 0, "revenue": 0.0, "cycle_times": []}
             tec = td["tecnicos"][tecnico]
-            tec["total"]   += 1
-            tec["revenue"] += total
+            tec["total"] += 1; tec["revenue"] += total
             if estado in EST_TERM:
                 tec["completados"] += 1
-                if ct is not None:
-                    tec["cycle_times"].append(ct)
-            elif estado in EST_ACT:
-                tec["wip"] += 1
+                if ct is not None: tec["cycle_times"].append(ct)
+            elif estado in EST_ACT: tec["wip"] += 1
     for td in tiendas.values():
         cts = td.pop("cycle_times", [])
         td["cycle_time_avg_hrs"] = round(sum(cts)/len(cts), 1) if cts else None
@@ -263,27 +221,17 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
     sa_vta    = sum(td["sin_asignar_vta"] for td in tiendas.values())
     all_cts   = [td["cycle_time_avg_hrs"] for td in tiendas.values() if td["cycle_time_avg_hrs"]]
     def cat_sum(lst):
-        return {
-            "count":   len(lst),
-            "revenue": round(sum(parse_total(t) for t in lst), 2),
-            "por_tienda": {
-                n: sum(1 for t in lst if t.get("_tienda")==n)
-                for n in TIENDAS_CONFIG if any(t.get("_tienda")==n for t in lst)
-            }
-        }
+        return {"count": len(lst), "revenue": round(sum(parse_total(t) for t in lst), 2),
+                "por_tienda": {n: sum(1 for t in lst if t.get("_tienda")==n)
+                    for n in TIENDAS_CONFIG if any(t.get("_tienda")==n for t in lst)}}
     return {
-        "hoy":       fecha_ref,
-        "ventana":   f"{desde} → {hasta}",
-        "red": {
-            "total":              total_red,
-            "completados":        comp_red,
-            "wip":                sum(td["wip"] for td in tiendas.values()),
-            "revenue":            round(rev_red, 2),
-            "eficiencia":         round(comp_red/total_red*100) if total_red > 0 else 0,
+        "hoy": fecha_ref, "ventana": f"{desde} → {hasta}",
+        "red": {"total": total_red, "completados": comp_red,
+            "wip": sum(td["wip"] for td in tiendas.values()),
+            "revenue": round(rev_red, 2),
+            "eficiencia": round(comp_red/total_red*100) if total_red > 0 else 0,
             "cycle_time_avg_hrs": round(sum(all_cts)/len(all_cts), 1) if all_cts else None,
-            "sin_asignar_rep":    sa_rep,
-            "sin_asignar_vta":    sa_vta,
-        },
+            "sin_asignar_rep": sa_rep, "sin_asignar_vta": sa_vta},
         "tiendas": list(tiendas.values()),
         "categorias_dia": {
             "venta_limpia":        cat_sum(cats["venta_limpia"]),
@@ -318,17 +266,74 @@ def get_all_cached(dias=None, desde=None, hasta=None):
         _cache_all["ts"]   = now
     return _cache_all["data"]
 
+def fetch_payments_dia(fecha_str):
+    """Obtiene pagos reales de /payments por tienda para una fecha.
+    Retorna: {tienda: {realizados, advances, total, count}}"""
+    resultados = {}
+    for nombre, key in TIENDAS_CONFIG.items():
+        if not key:
+            resultados[nombre] = {"realizados": 0.0, "advances": 0.0, "total": 0.0, "count": 0}
+            continue
+        headers = {"Authorization": key.strip(), "Accept": "application/json"}
+        realizados = advances = 0.0
+        count = 0
+        page  = 1
+        while True:
+            try:
+                r = requests.get(f"{MGR_BASE}/payments", headers=headers,
+                                 params={"page": page}, timeout=15)
+                r.raise_for_status()
+                batch = r.json()
+                if not isinstance(batch, list):
+                    batch = batch.get("payments") or batch.get("data") or []
+                if not batch: break
+                del_dia = [p for p in batch if date_str(p.get("date","")) == fecha_str]
+                for p in del_dia:
+                    monto = float(p.get("amount") or 0)
+                    if p.get("is_advance"): advances   += monto
+                    else:                   realizados += monto
+                    count += 1
+                fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
+                if fechas and min(fechas) < fecha_str: break
+                if len(batch) < 50: break
+                page += 1
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"[ERROR] payments {nombre} pag {page}: {e}")
+                break
+        resultados[nombre] = {"realizados": round(realizados, 2),
+            "advances": round(advances, 2), "total": round(realizados + advances, 2), "count": count}
+        print(f"[INFO] payments {nombre} {fecha_str}: realizados={realizados} advances={advances} count={count}")
+    return resultados
+
 def get_dia_kpis(fecha_str):
+    """KPIs de un día usando /payments como fuente de revenue real."""
+    payments = fetch_payments_dia(fecha_str)
     desde_90 = (date.fromisoformat(fecha_str) - timedelta(days=90)).isoformat()
     tickets, _, _ = fetch_all_parallel(desde=desde_90, hasta=fecha_str)
-    tickets_del_dia = [
-        t for t in tickets
-        if date_str((t.get("invoice") or {}).get("last_payment_date", "")) == fecha_str
-    ]
-    return compute_kpis(tickets_del_dia, fecha_str, fecha_str)
+    tickets_del_dia = [t for t in tickets
+        if date_str((t.get("invoice") or {}).get("last_payment_date", "")) == fecha_str]
+    kpis = compute_kpis(tickets_del_dia, fecha_str, fecha_str)
+    total_realizados = sum(v["realizados"] for v in payments.values())
+    total_advances   = sum(v["advances"]   for v in payments.values())
+    total_cobrado    = total_realizados + total_advances
+    kpis["red"]["revenue"]           = round(total_cobrado, 2)
+    kpis["red"]["revenue_realizado"]  = round(total_realizados, 2)
+    kpis["red"]["revenue_advance"]    = round(total_advances, 2)
+    kpis["payments"] = payments
+    for td in kpis["tiendas"]:
+        nombre = td["nombre"]
+        if nombre in payments:
+            td["revenue"]           = payments[nombre]["total"]
+            td["revenue_realizado"]  = payments[nombre]["realizados"]
+            td["revenue_advance"]    = payments[nombre]["advances"]
+    kpis["categorias_dia"]["advances"] = {
+        "count":   sum(v["count"] for v in payments.values() if v["advances"] > 0),
+        "revenue": round(total_advances, 2)
+    }
+    return kpis
 
-def fmt_q(valor):
-    return f"Q {valor:,.2f}"
+def fmt_q(valor): return f"Q {valor:,.2f}"
 
 def generar_analisis(tiendas_hoy, tiendas_ayer, rev_hoy, rev_ayer, var_pct):
     lineas = []
@@ -385,28 +390,41 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     subtitulo_style = ParagraphStyle("subtitulo", parent=styles["Heading2"], textColor=AZUL, fontSize=12)
     elementos.append(Paragraph("Desglose de ingresos", subtitulo_style))
     elementos.append(Spacer(1, 3*mm))
-    cats_hoy     = data_hoy.get("categorias_dia", {})
-    venta_hoy    = cats_hoy.get("venta_limpia",        {}).get("revenue", 0.0)
-    cartera_hoy  = cats_hoy.get("cobro_cartera",       {}).get("revenue", 0.0)
-    pipeline_hoy = cats_hoy.get("pipeline_sin_cobrar", {}).get("count",   0)
-    realizado    = venta_hoy + cartera_hoy
-    AMARILLO = colors.HexColor("#FFF8E1")
+    cats_hoy      = data_hoy.get("categorias_dia", {})
+    venta_hoy     = cats_hoy.get("venta_limpia",        {}).get("revenue", 0.0)
+    cartera_hoy   = cats_hoy.get("cobro_cartera",       {}).get("revenue", 0.0)
+    pipeline_hoy  = cats_hoy.get("pipeline_sin_cobrar", {}).get("count",   0)
+    rev_real      = data_hoy["red"].get("revenue_realizado", venta_hoy + cartera_hoy)
+    advances_real = data_hoy["red"].get("revenue_advance",   0.0)
+    total_cobrado = data_hoy["red"]["revenue"]
+    AMARILLO   = colors.HexColor("#FFF8E1")
+    AZUL_CLARO = colors.HexColor("#E3F4FB")
     desglose_data = [
         ["Categoría", "Monto", "Descripción"],
-        ["Venta del día",       fmt_q(venta_hoy),          "Órdenes creadas y cobradas hoy"],
-        ["Cobro de cartera",    fmt_q(cartera_hoy),        "Órdenes anteriores cobradas hoy"],
-        ["INGRESO REALIZADO",   fmt_q(realizado),          ""],
-        ["Pipeline sin cobrar", f"{pipeline_hoy} tickets", "Creados hoy, pago pendiente"],
+        ["Venta del día",        fmt_q(venta_hoy),     "Órdenes creadas y cobradas hoy"],
+        ["Cobro de cartera",     fmt_q(cartera_hoy),   "Órdenes anteriores cobradas hoy"],
+        ["INGRESO REALIZADO",    fmt_q(rev_real),       "Servicios completados"],
+        ["Advances / Anticipos", fmt_q(advances_real),  "Pagos anticipados (trabajo pendiente)"],
+        ["TOTAL COBRADO",        fmt_q(total_cobrado),  ""],
+        ["Pipeline sin cobrar",  f"{pipeline_hoy} tickets", "Creados hoy, pago pendiente"],
     ]
     desglose_table = Table(desglose_data, colWidths=[52*mm, 33*mm, 85*mm])
     desglose_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), NEGRO), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 9),
-        ("ALIGN", (1,0), (1,-1), "RIGHT"),
-        ("GRID", (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
-        ("ROWBACKGROUNDS", (0,1), (-1,2), [colors.white, GRIS]),
-        ("BACKGROUND", (0,3), (-1,3), AMARILLO), ("FONTNAME", (0,3), (-1,3), "Helvetica-Bold"),
-        ("BACKGROUND", (0,4), (-1,4), GRIS), ("TEXTCOLOR", (0,4), (-1,4), colors.HexColor("#888888")),
+        ("BACKGROUND",     (0,0), (-1,0),  NEGRO),
+        ("TEXTCOLOR",      (0,0), (-1,0),  colors.white),
+        ("FONTNAME",       (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",       (0,0), (-1,-1), 9),
+        ("ALIGN",          (1,0), (1,-1),  "RIGHT"),
+        ("GRID",           (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
+        ("ROWBACKGROUNDS", (0,1), (-1,2),  [colors.white, GRIS]),
+        ("BACKGROUND",     (0,3), (-1,3),  AMARILLO),
+        ("FONTNAME",       (0,3), (-1,3),  "Helvetica-Bold"),
+        ("BACKGROUND",     (0,4), (-1,4),  AZUL_CLARO),
+        ("BACKGROUND",     (0,5), (-1,5),  NEGRO),
+        ("TEXTCOLOR",      (0,5), (-1,5),  colors.white),
+        ("FONTNAME",       (0,5), (-1,5),  "Helvetica-Bold"),
+        ("BACKGROUND",     (0,6), (-1,6),  GRIS),
+        ("TEXTCOLOR",      (0,6), (-1,6),  colors.HexColor("#888888")),
     ]))
     elementos.append(desglose_table)
     elementos.append(Spacer(1, 8*mm))
@@ -451,13 +469,10 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     return buf
 
 def enviar_reporte_email(pdf_buffer, fecha_str):
-    if not EMAIL_USER or not EMAIL_APP_PASSWORD:
-        raise RuntimeError("Faltan EMAIL_USER / EMAIL_APP_PASSWORD")
-    if not REPORT_RECIPIENTS:
-        raise RuntimeError("REPORT_RECIPIENTS vacío")
+    if not EMAIL_USER or not EMAIL_APP_PASSWORD: raise RuntimeError("Faltan credenciales")
+    if not REPORT_RECIPIENTS: raise RuntimeError("REPORT_RECIPIENTS vacío")
     msg = MIMEMultipart()
-    msg["From"] = EMAIL_USER
-    msg["To"] = ", ".join(REPORT_RECIPIENTS)
+    msg["From"] = EMAIL_USER; msg["To"] = ", ".join(REPORT_RECIPIENTS)
     msg["Subject"] = f"Reporte Diario de Ventas Tatmon — {fecha_str}"
     msg.attach(MIMEText("Adjunto reporte diario.\n\nTe lo dejo ¡Niiiitiiiidoooo!", "plain"))
     adjunto = MIMEBase("application", "pdf")
@@ -466,28 +481,23 @@ def enviar_reporte_email(pdf_buffer, fecha_str):
     adjunto.add_header("Content-Disposition", f'attachment; filename="Reporte_Ventas_Tatmon_{fecha_str}.pdf"')
     msg.attach(adjunto)
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(EMAIL_USER, EMAIL_APP_PASSWORD)
-        server.send_message(msg)
+        server.starttls(); server.login(EMAIL_USER, EMAIL_APP_PASSWORD); server.send_message(msg)
 
 @app.route("/")
 def health():
     keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
-    return jsonify({"status": "ok", "service": "Tatmon API", "version": "4.6-debug",
+    return jsonify({"status": "ok", "service": "Tatmon API", "version": "4.7",
                     "tiendas_configuradas": keys_ok, "ventana_dias": DIAS_VENTANA,
                     "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}})
 
 @app.route("/kpis")
 def kpis():
-    try:
-        return jsonify(get_kpis_cached(dias=request.args.get("dias"), desde=request.args.get("desde"), hasta=request.args.get("hasta")))
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    try: return jsonify(get_kpis_cached(dias=request.args.get("dias"), desde=request.args.get("desde"), hasta=request.args.get("hasta")))
+    except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.route("/kpis/refresh")
 def refresh():
-    _cache["data"] = _cache_all["data"] = None
-    _cache["ts"]   = _cache_all["ts"]   = 0
+    _cache["data"] = _cache_all["data"] = None; _cache["ts"] = _cache_all["ts"] = 0
     data = get_kpis_cached()
     return jsonify({"ok": True, "total_tickets": data["total_tickets_raw"], "ventana": data["ventana"],
                     "tiendas_activas": data["tiendas_activas"], "updated_at": data["updated_at"]})
@@ -497,16 +507,13 @@ def tickets_all():
     try:
         tickets = get_all_cached(dias=request.args.get("dias"), desde=request.args.get("desde"), hasta=request.args.get("hasta"))
         return jsonify({"tickets": tickets, "total": len(tickets), "updated_at": datetime.now(timezone.utc).isoformat()})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.route("/debug/tiendas")
 def debug_tiendas():
     results = {}
     for nombre, key in TIENDAS_CONFIG.items():
-        if not key:
-            results[nombre] = {"error": "sin key"}
-            continue
+        if not key: results[nombre] = {"error": "sin key"}; continue
         headers = {"Authorization": key.strip(), "Accept": "application/json"}
         try:
             r = requests.get(f"{MGR_BASE}/tickets", headers=headers, params={"page": 1}, timeout=10)
@@ -519,39 +526,27 @@ def debug_tiendas():
                 "todas_fechas": fechas, "invoice_keys": list((sample.get("invoice") or {}).keys()),
                 "invoice_sample": sample.get("invoice"), "primer_ref": sample.get("ticket_ref"),
                 "ultimo_ref": batch[-1].get("ticket_ref") if batch else None}
-        except Exception as e:
-            results[nombre] = {"error": str(e)}
+        except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
 
 @app.route("/debug/payments")
 def debug_payments():
-    """Explora el endpoint /payments de MGR. Acepta ?fecha=YYYY-MM-DD"""
+    """Explora /payments de MGR. Acepta ?fecha=YYYY-MM-DD"""
     fecha = request.args.get("fecha", "2026-07-11")
     results = {}
     for nombre, key in TIENDAS_CONFIG.items():
-        if not key:
-            results[nombre] = {"error": "sin key"}
-            continue
+        if not key: results[nombre] = {"error": "sin key"}; continue
         headers = {"Authorization": key.strip(), "Accept": "application/json"}
         try:
-            # Probar sin filtro primero para ver estructura completa
-            r = requests.get(f"{MGR_BASE}/payments", headers=headers,
-                             params={"page": 1}, timeout=15)
+            r = requests.get(f"{MGR_BASE}/payments", headers=headers, params={"page": 1}, timeout=15)
             data = r.json()
             batch = data if isinstance(data, list) else (data.get("payments") or data.get("data") or [])
             sample = batch[0] if batch else {}
-            # Filtrar por fecha localmente para ver cuantos hay
-            del_dia = [p for p in batch if fecha in str(p.get("created_at","") or p.get("date","") or p.get("payment_date","") or "")]
-            results[nombre] = {
-                "status":       r.status_code,
-                "total_pag1":   len(batch),
-                "del_dia":      len(del_dia),
-                "keys":         list(sample.keys()) if sample else [],
-                "sample":       sample,
-                "raw_type":     "array" if isinstance(data, list) else list(data.keys()),
-            }
-        except Exception as e:
-            results[nombre] = {"error": str(e)}
+            del_dia = [p for p in batch if fecha in str(p.get("date","") or "")]
+            results[nombre] = {"status": r.status_code, "total_pag1": len(batch),
+                "del_dia": len(del_dia), "keys": list(sample.keys()) if sample else [],
+                "sample": sample, "raw_type": "array" if isinstance(data, list) else list(data.keys())}
+        except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
 
 @app.route("/reporte/preview")
@@ -559,40 +554,30 @@ def reporte_preview():
     """Genera el PDF sin enviar. Acepta ?fecha=YYYY-MM-DD"""
     try:
         fecha_param = request.args.get("fecha")
-        if fecha_param:
-            hoy_str  = fecha_param
-            ayer_str = (date.fromisoformat(fecha_param) - timedelta(days=1)).isoformat()
-        else:
-            hoy_str  = date.today().isoformat()
-            ayer_str = (date.today() - timedelta(days=1)).isoformat()
+        hoy_str  = fecha_param or date.today().isoformat()
+        ayer_str = (date.fromisoformat(hoy_str) - timedelta(days=1)).isoformat()
         data_hoy  = get_dia_kpis(hoy_str)
         data_ayer = get_dia_kpis(ayer_str)
         pdf_buffer = generar_pdf_reporte(data_hoy, data_ayer, hoy_str)
         return send_file(pdf_buffer, mimetype="application/pdf",
                           as_attachment=False, download_name=f"reporte_{hoy_str}.pdf")
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/reporte/enviar")
 def reporte_enviar():
-    """Genera y envía el PDF por correo. Acepta ?fecha=YYYY-MM-DD"""
+    """Genera y envía el PDF. Acepta ?fecha=YYYY-MM-DD"""
     if REPORT_SECRET and request.args.get("secret") != REPORT_SECRET:
         return jsonify({"ok": False, "error": "no autorizado"}), 401
     try:
         fecha_param = request.args.get("fecha")
-        if fecha_param:
-            hoy_str  = fecha_param
-            ayer_str = (date.fromisoformat(fecha_param) - timedelta(days=1)).isoformat()
-        else:
-            hoy_str  = date.today().isoformat()
-            ayer_str = (date.today() - timedelta(days=1)).isoformat()
+        hoy_str  = fecha_param or date.today().isoformat()
+        ayer_str = (date.fromisoformat(hoy_str) - timedelta(days=1)).isoformat()
         data_hoy  = get_dia_kpis(hoy_str)
         data_ayer = get_dia_kpis(ayer_str)
         pdf_buffer = generar_pdf_reporte(data_hoy, data_ayer, hoy_str)
         enviar_reporte_email(pdf_buffer, hoy_str)
         return jsonify({"ok": True, "fecha": hoy_str, "destinatarios": REPORT_RECIPIENTS})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    except Exception as e: return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
