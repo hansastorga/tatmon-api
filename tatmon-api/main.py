@@ -86,8 +86,6 @@ def parse_total(ticket):
                     return f
             except:
                 pass
-    # MGR no trae monto en invoice — extraer de descripción del ticket
-    # Formato: "Precio pactado: Q400" o "Precio pactado: Q1,200.00"
     import re
     desc = ticket.get("description") or ""
     m = re.search(r'[Pp]recio\s+pactado\s*:\s*Q?\s*([\d,]+(?:\.\d+)?)', desc)
@@ -114,16 +112,16 @@ def cycle_time_hours(ticket):
     except:
         return None
 
-def classify_ticket(ticket, hoy_str):
+def classify_ticket(ticket, fecha_str):
     creado = date_str(ticket.get("created_date", ""))
     inv    = ticket.get("invoice") or {}
     pagado = date_str(inv.get("last_payment_date", ""))
     paid   = bool(pagado)
-    if creado == hoy_str and paid and pagado == hoy_str:
+    if creado == fecha_str and paid and pagado == fecha_str:
         return "venta_limpia"
-    elif creado < hoy_str and paid and pagado == hoy_str:
+    elif creado < fecha_str and paid and pagado == fecha_str:
         return "cobro_cartera"
-    elif creado == hoy_str and not paid:
+    elif creado == fecha_str and not paid:
         return "pipeline_sin_cobrar"
     return "otro"
 
@@ -191,11 +189,11 @@ def fetch_all_parallel(dias=None, desde=None, hasta=None):
     return all_tickets, desde_str, hasta_str
 
 def compute_kpis(tickets, desde_str=None, hasta_str=None):
-    hoy_str  = date.today().isoformat()
-    desde    = desde_str or (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
-    hasta    = hasta_str or hoy_str
-    tiendas  = {}
-    cats     = {"venta_limpia":[], "cobro_cartera":[], "pipeline_sin_cobrar":[]}
+    fecha_ref = desde_str or date.today().isoformat()
+    desde     = desde_str or (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
+    hasta     = hasta_str or date.today().isoformat()
+    tiendas   = {}
+    cats      = {"venta_limpia":[], "cobro_cartera":[], "pipeline_sin_cobrar":[]}
 
     for t in tickets:
         tienda  = t.get("_tienda") or "Sin tienda"
@@ -205,7 +203,7 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
         ct      = cycle_time_hours(t)
         venta   = is_venta(t)
         ref     = t.get("ticket_ref") or ""
-        cat     = classify_ticket(t, hoy_str)
+        cat     = classify_ticket(t, fecha_ref)
 
         if cat in cats:
             cats[cat].append(t)
@@ -285,8 +283,8 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
         }
 
     return {
-        "hoy":       hoy_str,
-        "ventana":   f"{desde} → {hasta or hoy_str}",
+        "hoy":       fecha_ref,
+        "ventana":   f"{desde} → {hasta}",
         "red": {
             "total":              total_red,
             "completados":        comp_red,
@@ -337,9 +335,15 @@ def get_all_cached(dias=None, desde=None, hasta=None):
     return _cache_all["data"]
 
 def get_dia_kpis(fecha_str):
-    """KPIs de un solo día exacto (usado por el reporte diario)."""
-    tickets, desde_str, hasta_str = fetch_all_parallel(desde=fecha_str, hasta=fecha_str)
-    return compute_kpis(tickets, desde_str, hasta_str)
+    """KPIs de un día: trae tickets de los últimos 90 días y filtra por fecha de PAGO.
+    Esto captura cobros de cartera (órdenes antiguas cobradas en esa fecha)."""
+    desde_90 = (date.fromisoformat(fecha_str) - timedelta(days=90)).isoformat()
+    tickets, _, _ = fetch_all_parallel(desde=desde_90, hasta=fecha_str)
+    tickets_del_dia = [
+        t for t in tickets
+        if date_str((t.get("invoice") or {}).get("last_payment_date", "")) == fecha_str
+    ]
+    return compute_kpis(tickets_del_dia, fecha_str, fecha_str)
 
 def fmt_q(valor):
     return f"Q {valor:,.2f}"
@@ -389,7 +393,7 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     tickets_hoy = data_hoy["red"]["total"]
 
     kpi_data = [
-        ["VENTAS HOY", "VENTAS AYER", "VARIACIÓN", "TICKETS HOY"],
+        ["INGRESOS HOY", "INGRESOS AYER", "VARIACIÓN", "TICKETS HOY"],
         [fmt_q(rev_hoy), fmt_q(rev_ayer), f"{var_pct:+.1f}%", str(tickets_hoy)],
     ]
     kpi_table = Table(kpi_data, colWidths=[42*mm]*4)
@@ -412,7 +416,44 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     elementos.append(Spacer(1, 8*mm))
 
     subtitulo_style = ParagraphStyle("subtitulo", parent=styles["Heading2"], textColor=AZUL, fontSize=12)
-    elementos.append(Paragraph("Ventas por sucursal", subtitulo_style))
+
+    # ── Desglose de ingresos ────────────────────────────────
+    elementos.append(Paragraph("Desglose de ingresos", subtitulo_style))
+    elementos.append(Spacer(1, 3*mm))
+
+    cats_hoy     = data_hoy.get("categorias_dia", {})
+    venta_hoy    = cats_hoy.get("venta_limpia",        {}).get("revenue", 0.0)
+    cartera_hoy  = cats_hoy.get("cobro_cartera",       {}).get("revenue", 0.0)
+    pipeline_hoy = cats_hoy.get("pipeline_sin_cobrar", {}).get("count",   0)
+    realizado    = venta_hoy + cartera_hoy
+
+    AMARILLO = colors.HexColor("#FFF8E1")
+    desglose_data = [
+        ["Categoría", "Monto", "Descripción"],
+        ["Venta del día",       fmt_q(venta_hoy),          "Órdenes creadas y cobradas hoy"],
+        ["Cobro de cartera",    fmt_q(cartera_hoy),        "Órdenes anteriores cobradas hoy"],
+        ["INGRESO REALIZADO",   fmt_q(realizado),          ""],
+        ["Pipeline sin cobrar", f"{pipeline_hoy} tickets", "Creados hoy, pago pendiente"],
+    ]
+    desglose_table = Table(desglose_data, colWidths=[52*mm, 33*mm, 85*mm])
+    desglose_table.setStyle(TableStyle([
+        ("BACKGROUND",     (0,0), (-1,0),  NEGRO),
+        ("TEXTCOLOR",      (0,0), (-1,0),  colors.white),
+        ("FONTNAME",       (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",       (0,0), (-1,-1), 9),
+        ("ALIGN",          (1,0), (1,-1),  "RIGHT"),
+        ("GRID",           (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
+        ("ROWBACKGROUNDS", (0,1), (-1,2),  [colors.white, GRIS]),
+        ("BACKGROUND",     (0,3), (-1,3),  AMARILLO),
+        ("FONTNAME",       (0,3), (-1,3),  "Helvetica-Bold"),
+        ("BACKGROUND",     (0,4), (-1,4),  GRIS),
+        ("TEXTCOLOR",      (0,4), (-1,4),  colors.HexColor("#888888")),
+    ]))
+    elementos.append(desglose_table)
+    elementos.append(Spacer(1, 8*mm))
+
+    # ── Ventas por sucursal ──────────────────────────────
+    elementos.append(Paragraph("Ingresos por sucursal", subtitulo_style))
     elementos.append(Spacer(1, 3*mm))
 
     tiendas_hoy  = {t["nombre"]: t for t in data_hoy["tiendas"]}
@@ -444,6 +485,7 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     elementos.append(tabla)
     elementos.append(Spacer(1, 8*mm))
 
+    # ── Análisis rápido ────────────────────────────────
     elementos.append(Paragraph("Análisis rápido", subtitulo_style))
     elementos.append(Spacer(1, 3*mm))
 
@@ -494,7 +536,7 @@ def enviar_reporte_email(pdf_buffer, fecha_str):
 def health():
     keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
     return jsonify({
-        "status": "ok", "service": "Tatmon API", "version": "4.3",
+        "status": "ok", "service": "Tatmon API", "version": "4.4",
         "tiendas_configuradas": keys_ok,
         "ventana_dias": DIAS_VENTANA,
         "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}
