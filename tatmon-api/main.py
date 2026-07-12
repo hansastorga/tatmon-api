@@ -15,6 +15,8 @@ from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+from reportlab.platypus import PageBreak
+from reportlab.graphics.shapes import Drawing, Rect, String
 
 app = Flask(__name__)
 CORS(app)
@@ -53,6 +55,9 @@ NEGRO   = colors.HexColor("#1A1A1A")
 GRIS    = colors.HexColor("#F2F2F2")
 VERDE   = colors.HexColor("#1E8E3E")
 ROJO    = colors.HexColor("#D93025")
+AMARILLO   = colors.HexColor("#FFF8E1")
+AZUL_CLARO = colors.HexColor("#E3F4FB")
+VERDE_CLARO = colors.HexColor("#E8F5E9")
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.jpg")
 
@@ -261,7 +266,6 @@ def get_all_cached(dias=None, desde=None, hasta=None):
     return _cache_all["data"]
 
 def fetch_payments_dia(fecha_str):
-    """Obtiene pagos reales de /payments por tienda para una fecha."""
     resultados = {}
     for nombre, key in TIENDAS_CONFIG.items():
         if not key:
@@ -298,7 +302,6 @@ def fetch_payments_dia(fecha_str):
     return resultados
 
 def get_dia_kpis(fecha_str):
-    """KPIs de un día usando /payments como fuente de revenue real."""
     payments = fetch_payments_dia(fecha_str)
     desde_30 = (date.fromisoformat(fecha_str) - timedelta(days=30)).isoformat()
     tickets, _, _ = fetch_all_parallel(desde=desde_30, hasta=fecha_str)
@@ -322,9 +325,28 @@ def get_dia_kpis(fecha_str):
         "count":   sum(v["count"] for v in payments.values() if v["advances"] > 0),
         "revenue": round(total_advances, 2)
     }
+    kpis["_tickets_raw"] = tickets_del_dia
     return kpis
 
 def fmt_q(valor): return f"Q {valor:,.2f}"
+
+def categorizar_tickets_dia(tickets, fecha_str):
+    """Clasifica tickets del día en Teléfonos y Reparaciones por issue_type."""
+    telefonos    = {"count": 0, "revenue": 0.0, "tiendas": {}}
+    reparaciones = {"count": 0, "revenue": 0.0, "tiendas": {}}
+    for t in tickets:
+        tipo   = ((t.get("issue_type") or {}).get("label") or "").strip()
+        total  = parse_total(t)
+        tienda = t.get("_tienda") or "Sin tienda"
+        if tipo == "Venta de equipos.": cat = telefonos
+        elif tipo:                      cat = reparaciones
+        else:                           continue
+        cat["count"]   += 1
+        cat["revenue"] += total
+        cat["tiendas"][tienda] = cat["tiendas"].get(tienda, 0) + 1
+    telefonos["revenue"]    = round(telefonos["revenue"], 2)
+    reparaciones["revenue"] = round(reparaciones["revenue"], 2)
+    return {"telefonos": telefonos, "reparaciones": reparaciones}
 
 def generar_analisis(tiendas_hoy, tiendas_ayer, rev_hoy, rev_ayer, var_pct):
     lineas = []
@@ -348,17 +370,24 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=15*mm, bottomMargin=15*mm, leftMargin=15*mm, rightMargin=15*mm)
     styles = getSampleStyleSheet()
+    titulo_style   = ParagraphStyle("titulo",    parent=styles["Title"],   textColor=NEGRO,  fontSize=16)
+    subtitulo_style = ParagraphStyle("subtitulo", parent=styles["Heading2"], textColor=AZUL,  fontSize=12)
+    cuerpo_style   = ParagraphStyle("cuerpo",    parent=styles["Normal"],  fontSize=10, leading=14)
+    pie_style      = ParagraphStyle("pie",        parent=styles["Normal"],  textColor=NARANJA, fontSize=9, alignment=TA_CENTER)
     elementos = []
+
+    # ─── PÁGINA 1 ─────────────────────────────────────────────────────────────
     if os.path.exists(LOGO_PATH):
         elementos.append(Image(LOGO_PATH, width=55*mm, height=26.3*mm))
         elementos.append(Spacer(1, 4*mm))
-    titulo_style = ParagraphStyle("titulo", parent=styles["Title"], textColor=NEGRO, fontSize=16)
     elementos.append(Paragraph(f"Reporte Diario de Ventas — {fecha_str}", titulo_style))
     elementos.append(Spacer(1, 6*mm))
+
     rev_hoy  = data_hoy["red"]["revenue"]
     rev_ayer = data_ayer["red"]["revenue"]
     var_pct  = ((rev_hoy - rev_ayer) / rev_ayer * 100) if rev_ayer else (100.0 if rev_hoy else 0.0)
     tickets_hoy = data_hoy["red"]["total"]
+
     kpi_data = [
         ["INGRESOS HOY", "INGRESOS AYER", "VARIACIÓN", "TICKETS HOY"],
         [fmt_q(rev_hoy), fmt_q(rev_ayer), f"{var_pct:+.1f}%", str(tickets_hoy)],
@@ -378,7 +407,7 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     ]))
     elementos.append(kpi_table)
     elementos.append(Spacer(1, 8*mm))
-    subtitulo_style = ParagraphStyle("subtitulo", parent=styles["Heading2"], textColor=AZUL, fontSize=12)
+
     elementos.append(Paragraph("Desglose de ingresos", subtitulo_style))
     elementos.append(Spacer(1, 3*mm))
     cats_hoy      = data_hoy.get("categorias_dia", {})
@@ -388,8 +417,6 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     rev_real      = data_hoy["red"].get("revenue_realizado", venta_hoy + cartera_hoy)
     advances_real = data_hoy["red"].get("revenue_advance",   0.0)
     total_cobrado = data_hoy["red"]["revenue"]
-    AMARILLO   = colors.HexColor("#FFF8E1")
-    AZUL_CLARO = colors.HexColor("#E3F4FB")
     desglose_data = [
         ["Categoría", "Monto", "Descripción"],
         ["Venta del día",        fmt_q(venta_hoy),     "Órdenes creadas y cobradas hoy"],
@@ -401,34 +428,30 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     ]
     desglose_table = Table(desglose_data, colWidths=[52*mm, 33*mm, 85*mm])
     desglose_table.setStyle(TableStyle([
-        ("BACKGROUND",     (0,0), (-1,0),  NEGRO),
-        ("TEXTCOLOR",      (0,0), (-1,0),  colors.white),
+        ("BACKGROUND",     (0,0), (-1,0),  NEGRO), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
         ("FONTNAME",       (0,0), (-1,0),  "Helvetica-Bold"),
-        ("FONTSIZE",       (0,0), (-1,-1), 9),
-        ("ALIGN",          (1,0), (1,-1),  "RIGHT"),
+        ("FONTSIZE",       (0,0), (-1,-1), 9), ("ALIGN", (1,0), (1,-1), "RIGHT"),
         ("GRID",           (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
         ("ROWBACKGROUNDS", (0,1), (-1,2),  [colors.white, GRIS]),
-        ("BACKGROUND",     (0,3), (-1,3),  AMARILLO),
-        ("FONTNAME",       (0,3), (-1,3),  "Helvetica-Bold"),
+        ("BACKGROUND",     (0,3), (-1,3),  AMARILLO), ("FONTNAME", (0,3), (-1,3), "Helvetica-Bold"),
         ("BACKGROUND",     (0,4), (-1,4),  AZUL_CLARO),
-        ("BACKGROUND",     (0,5), (-1,5),  NEGRO),
-        ("TEXTCOLOR",      (0,5), (-1,5),  colors.white),
+        ("BACKGROUND",     (0,5), (-1,5),  NEGRO), ("TEXTCOLOR", (0,5), (-1,5), colors.white),
         ("FONTNAME",       (0,5), (-1,5),  "Helvetica-Bold"),
-        ("BACKGROUND",     (0,6), (-1,6),  GRIS),
-        ("TEXTCOLOR",      (0,6), (-1,6),  colors.HexColor("#888888")),
+        ("BACKGROUND",     (0,6), (-1,6),  GRIS), ("TEXTCOLOR", (0,6), (-1,6), colors.HexColor("#888888")),
     ]))
     elementos.append(desglose_table)
     elementos.append(Spacer(1, 8*mm))
+
     elementos.append(Paragraph("Ingresos por sucursal", subtitulo_style))
     elementos.append(Spacer(1, 3*mm))
-    tiendas_hoy  = {t["nombre"]: t for t in data_hoy["tiendas"]}
-    tiendas_ayer = {t["nombre"]: t for t in data_ayer["tiendas"]}
-    nombres = sorted(set(TIENDAS_CONFIG) | set(tiendas_hoy) | set(tiendas_ayer))
+    tiendas_hoy_d  = {t["nombre"]: t for t in data_hoy["tiendas"]}
+    tiendas_ayer_d = {t["nombre"]: t for t in data_ayer["tiendas"]}
+    nombres = sorted(set(TIENDAS_CONFIG) | set(tiendas_hoy_d) | set(tiendas_ayer_d))
     tabla_data = [["Sucursal", "Hoy", "Ayer", "Variación"]]
     filas_color = []
     for i, nombre in enumerate(nombres, start=1):
-        rh = tiendas_hoy.get(nombre, {}).get("revenue", 0.0)
-        ra = tiendas_ayer.get(nombre, {}).get("revenue", 0.0)
+        rh = tiendas_hoy_d.get(nombre, {}).get("revenue", 0.0)
+        ra = tiendas_ayer_d.get(nombre, {}).get("revenue", 0.0)
         var = ((rh - ra) / ra * 100) if ra else (100.0 if rh else 0.0)
         tabla_data.append([nombre, fmt_q(rh), fmt_q(ra), f"{var:+.1f}%"])
         filas_color.append((i, VERDE if var >= 0 else ROJO))
@@ -445,16 +468,96 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     tabla.setStyle(TableStyle(estilo))
     elementos.append(tabla)
     elementos.append(Spacer(1, 8*mm))
+
     elementos.append(Paragraph("Análisis rápido", subtitulo_style))
     elementos.append(Spacer(1, 3*mm))
-    analisis = generar_analisis(tiendas_hoy, tiendas_ayer, rev_hoy, rev_ayer, var_pct)
-    cuerpo_style = ParagraphStyle("cuerpo", parent=styles["Normal"], fontSize=10, leading=14)
+    analisis = generar_analisis(tiendas_hoy_d, tiendas_ayer_d, rev_hoy, rev_ayer, var_pct)
     for linea in analisis:
         elementos.append(Paragraph(f"•  {linea}", cuerpo_style))
         elementos.append(Spacer(1, 1.5*mm))
     elementos.append(Spacer(1, 10*mm))
-    pie_style = ParagraphStyle("pie", parent=styles["Normal"], textColor=NARANJA, fontSize=9, alignment=TA_CENTER)
     elementos.append(Paragraph("Te lo dejo ¡Niiiitiiiidoooo!", pie_style))
+
+    # ─── PÁGINA 2: Desglose por categoría ─────────────────────────────────────
+    elementos.append(PageBreak())
+    elementos.append(Paragraph(f"Desglose por Categoría — {fecha_str}", titulo_style))
+    elementos.append(Spacer(1, 6*mm))
+
+    tickets_raw = data_hoy.get("_tickets_raw", [])
+    cats2 = categorizar_tickets_dia(tickets_raw, fecha_str)
+    tel   = cats2["telefonos"]
+    rep   = cats2["reparaciones"]
+    rev_tel = tel["revenue"]
+    rev_rep = rep["revenue"]
+    rev_total_real = data_hoy["red"]["revenue"]
+    pct_tel = round(rev_tel / rev_total_real * 100, 1) if rev_total_real else 0
+    pct_rep = round(rev_rep / rev_total_real * 100, 1) if rev_total_real else 0
+    pct_adv = round(max(100 - pct_tel - pct_rep, 0), 1)
+
+    cat_data = [
+        ["Categoría", "Tickets", "Ingresos (tickets)", "% del total cobrado"],
+        ["Teléfonos",               str(tel["count"]), fmt_q(rev_tel),       f"{pct_tel}%"],
+        ["Reparaciones",             str(rep["count"]), fmt_q(rev_rep),       f"{pct_rep}%"],
+        ["Advances / sin clasificar", "—",              "—",                  f"{pct_adv}%"],
+        ["TOTAL COBRADO",            "—",              fmt_q(rev_total_real), ""],
+    ]
+    cat_table = Table(cat_data, colWidths=[65*mm, 22*mm, 48*mm, 45*mm])
+    cat_table.setStyle(TableStyle([
+        ("BACKGROUND",  (0,0), (-1,0),  NEGRO), ("TEXTCOLOR",  (0,0), (-1,0),  colors.white),
+        ("FONTNAME",    (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",    (0,0), (-1,-1), 9), ("ALIGN", (1,0), (-1,-1), "CENTER"),
+        ("GRID",        (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
+        ("BACKGROUND",  (0,1), (-1,1),  AZUL_CLARO),
+        ("BACKGROUND",  (0,2), (-1,2),  VERDE_CLARO),
+        ("BACKGROUND",  (0,3), (-1,3),  GRIS), ("TEXTCOLOR", (0,3), (-1,3), colors.HexColor("#888888")),
+        ("BACKGROUND",  (0,4), (-1,4),  NEGRO), ("TEXTCOLOR", (0,4), (-1,4), colors.white),
+        ("FONTNAME",    (0,4), (-1,4),  "Helvetica-Bold"),
+    ]))
+    elementos.append(Paragraph("Composición de ingresos", subtitulo_style))
+    elementos.append(Spacer(1, 3*mm))
+    elementos.append(cat_table)
+    elementos.append(Spacer(1, 8*mm))
+
+    # Barra visual
+    elementos.append(Paragraph("Distribución visual", subtitulo_style))
+    elementos.append(Spacer(1, 3*mm))
+    BAR_W = 170*mm; BAR_H = 14*mm
+    d = Drawing(BAR_W, BAR_H + 20)
+    x = 0
+    segmentos = [
+        (pct_tel, colors.HexColor("#00A7E1"), f"Teléfonos {pct_tel}%"),
+        (pct_rep, colors.HexColor("#1E8E3E"), f"Reparaciones {pct_rep}%"),
+        (pct_adv, colors.HexColor("#CCCCCC"), f"Otros {pct_adv}%"),
+    ]
+    for pct, col, label in segmentos:
+        w = BAR_W * pct / 100
+        if w < 1: continue
+        d.add(Rect(x, 6, w, BAR_H, fillColor=col, strokeColor=colors.white, strokeWidth=1))
+        if w > 25:
+            d.add(String(x + w/2, 10, label, fontName="Helvetica-Bold", fontSize=7,
+                         fillColor=colors.white, textAnchor="middle"))
+        x += w
+    elementos.append(d)
+    elementos.append(Spacer(1, 8*mm))
+
+    # Detalle por tienda
+    elementos.append(Paragraph("Desglose por sucursal", subtitulo_style))
+    elementos.append(Spacer(1, 3*mm))
+    det_data = [["Sucursal", "Tickets Teléfonos", "Tickets Reparaciones"]]
+    for tn in sorted(TIENDAS_CONFIG.keys()):
+        det_data.append([tn, str(tel["tiendas"].get(tn, 0)), str(rep["tiendas"].get(tn, 0))])
+    det_table = Table(det_data, colWidths=[80*mm, 45*mm, 55*mm])
+    det_table.setStyle(TableStyle([
+        ("BACKGROUND",     (0,0), (-1,0),  AZUL), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME",       (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",       (0,0), (-1,-1), 9), ("ALIGN", (1,0), (-1,-1), "CENTER"),
+        ("GRID",           (0,0), (-1,-1), 0.5, colors.HexColor("#DDDDDD")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, GRIS]),
+    ]))
+    elementos.append(det_table)
+    elementos.append(Spacer(1, 10*mm))
+    elementos.append(Paragraph("Te lo dejo ¡Niiiitiiiidoooo!", pie_style))
+
     doc.build(elementos)
     buf.seek(0)
     return buf
@@ -477,7 +580,7 @@ def enviar_reporte_email(pdf_buffer, fecha_str):
 @app.route("/")
 def health():
     keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
-    return jsonify({"status": "ok", "service": "Tatmon API", "version": "4.8",
+    return jsonify({"status": "ok", "service": "Tatmon API", "version": "4.9",
                     "tiendas_configuradas": keys_ok, "ventana_dias": DIAS_VENTANA,
                     "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}})
 
@@ -514,8 +617,7 @@ def debug_tiendas():
             fechas = [date_str(t.get("created_date","")) for t in batch]
             issue_types = list({(t.get("issue_type") or {}).get("label","") for t in batch if (t.get("issue_type") or {}).get("label")})
             results[nombre] = {"status": r.status_code, "count_pag1": len(batch),
-                "primera_fecha": fechas[0] if fechas else None,
-                "issue_types": issue_types,
+                "primera_fecha": fechas[0] if fechas else None, "issue_types": issue_types,
                 "invoice_keys": list((sample.get("invoice") or {}).keys())}
         except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
@@ -534,8 +636,7 @@ def debug_payments():
             sample = batch[0] if batch else {}
             del_dia = [p for p in batch if fecha in str(p.get("date","") or "")]
             results[nombre] = {"status": r.status_code, "total_pag1": len(batch),
-                "del_dia": len(del_dia), "keys": list(sample.keys()) if sample else [],
-                "sample": sample}
+                "del_dia": len(del_dia), "keys": list(sample.keys()) if sample else [], "sample": sample}
         except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
 
