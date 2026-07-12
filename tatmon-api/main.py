@@ -111,9 +111,6 @@ def classify_ticket(ticket, fecha_str):
     elif creado == fecha_str and not paid: return "pipeline_sin_cobrar"
     return "otro"
 
-def dentro_ventana(ticket, desde_str):
-    return date_str(ticket.get("created_date", "")) >= desde_str
-
 def fetch_tickets_for_tienda_rango(nombre, api_key, desde_str, hasta_str):
     if not api_key: return nombre, []
     all_tickets = []
@@ -139,11 +136,6 @@ def fetch_tickets_for_tienda_rango(nombre, api_key, desde_str, hasta_str):
     en_ventana = [t for t in all_tickets if t.get("created_date") and desde_str <= date_str(t["created_date"]) <= hasta_str]
     print(f"[INFO] {nombre}: {len(en_ventana)} tickets ({desde_str} to {hasta_str})")
     return nombre, en_ventana
-
-def fetch_tickets_for_tienda(nombre, api_key):
-    _, tickets = fetch_tickets_for_tienda_rango(nombre, api_key,
-        (date.today() - timedelta(days=DIAS_VENTANA)).isoformat(), date.today().isoformat())
-    return nombre, tickets
 
 def fetch_all_parallel(dias=None, desde=None, hasta=None):
     if desde and hasta:
@@ -181,8 +173,9 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
         if tienda not in tiendas:
             tiendas[tienda] = {"nombre": tienda, "total": 0, "completados": 0, "wip": 0,
                 "revenue": 0.0, "sin_asignar_rep": 0, "sin_asignar_vta": 0,
-                "cycle_times": [], "tecnicos": {}, "boletos_sin_asignar": [],
-                "venta_limpia": 0, "cobro_cartera": 0, "pipeline_sin_cobrar": 0}
+                "tecnicos": {}, "boletos_sin_asignar": [],
+                "venta_limpia": 0, "cobro_cartera": 0, "pipeline_sin_cobrar": 0,
+                "cycle_times": []}
         td = tiendas[tienda]
         td["total"] += 1; td["revenue"] += total
         if cat in cats: td[cat] += 1
@@ -238,6 +231,7 @@ def compute_kpis(tickets, desde_str=None, hasta_str=None):
             "cobro_cartera":       cat_sum(cats["cobro_cartera"]),
             "pipeline_sin_cobrar": cat_sum(cats["pipeline_sin_cobrar"]),
         },
+        "issue_types": list({(t.get("issue_type") or {}).get("label","") for t in tickets if (t.get("issue_type") or {}).get("label")}),
         "tiendas_status": {n: "ok" if k else "sin_key" for n, k in TIENDAS_CONFIG.items()},
         "tiendas_activas": [n for n, k in TIENDAS_CONFIG.items() if k],
         "total_tickets_raw": len(tickets),
@@ -267,8 +261,7 @@ def get_all_cached(dias=None, desde=None, hasta=None):
     return _cache_all["data"]
 
 def fetch_payments_dia(fecha_str):
-    """Obtiene pagos reales de /payments por tienda para una fecha.
-    Retorna: {tienda: {realizados, advances, total, count}}"""
+    """Obtiene pagos reales de /payments por tienda para una fecha."""
     resultados = {}
     for nombre, key in TIENDAS_CONFIG.items():
         if not key:
@@ -276,8 +269,7 @@ def fetch_payments_dia(fecha_str):
             continue
         headers = {"Authorization": key.strip(), "Accept": "application/json"}
         realizados = advances = 0.0
-        count = 0
-        page  = 1
+        count = 0; page = 1
         while True:
             try:
                 r = requests.get(f"{MGR_BASE}/payments", headers=headers,
@@ -296,8 +288,7 @@ def fetch_payments_dia(fecha_str):
                 fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
                 if fechas and min(fechas) < fecha_str: break
                 if len(batch) < 50: break
-                page += 1
-                time.sleep(0.2)
+                page += 1; time.sleep(0.2)
             except Exception as e:
                 print(f"[ERROR] payments {nombre} pag {page}: {e}")
                 break
@@ -309,8 +300,8 @@ def fetch_payments_dia(fecha_str):
 def get_dia_kpis(fecha_str):
     """KPIs de un día usando /payments como fuente de revenue real."""
     payments = fetch_payments_dia(fecha_str)
-    desde_90 = (date.fromisoformat(fecha_str) - timedelta(days=90)).isoformat()
-    tickets, _, _ = fetch_all_parallel(desde=desde_90, hasta=fecha_str)
+    desde_30 = (date.fromisoformat(fecha_str) - timedelta(days=30)).isoformat()
+    tickets, _, _ = fetch_all_parallel(desde=desde_30, hasta=fecha_str)
     tickets_del_dia = [t for t in tickets
         if date_str((t.get("invoice") or {}).get("last_payment_date", "")) == fecha_str]
     kpis = compute_kpis(tickets_del_dia, fecha_str, fecha_str)
@@ -486,7 +477,7 @@ def enviar_reporte_email(pdf_buffer, fecha_str):
 @app.route("/")
 def health():
     keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
-    return jsonify({"status": "ok", "service": "Tatmon API", "version": "4.7",
+    return jsonify({"status": "ok", "service": "Tatmon API", "version": "4.8",
                     "tiendas_configuradas": keys_ok, "ventana_dias": DIAS_VENTANA,
                     "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}})
 
@@ -521,17 +512,16 @@ def debug_tiendas():
             batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
             sample = batch[0] if batch else {}
             fechas = [date_str(t.get("created_date","")) for t in batch]
+            issue_types = list({(t.get("issue_type") or {}).get("label","") for t in batch if (t.get("issue_type") or {}).get("label")})
             results[nombre] = {"status": r.status_code, "count_pag1": len(batch),
-                "primera_fecha": fechas[0] if fechas else None, "ultima_fecha": fechas[-1] if fechas else None,
-                "todas_fechas": fechas, "invoice_keys": list((sample.get("invoice") or {}).keys()),
-                "invoice_sample": sample.get("invoice"), "primer_ref": sample.get("ticket_ref"),
-                "ultimo_ref": batch[-1].get("ticket_ref") if batch else None}
+                "primera_fecha": fechas[0] if fechas else None,
+                "issue_types": issue_types,
+                "invoice_keys": list((sample.get("invoice") or {}).keys())}
         except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
 
 @app.route("/debug/payments")
 def debug_payments():
-    """Explora /payments de MGR. Acepta ?fecha=YYYY-MM-DD"""
     fecha = request.args.get("fecha", "2026-07-11")
     results = {}
     for nombre, key in TIENDAS_CONFIG.items():
@@ -545,13 +535,12 @@ def debug_payments():
             del_dia = [p for p in batch if fecha in str(p.get("date","") or "")]
             results[nombre] = {"status": r.status_code, "total_pag1": len(batch),
                 "del_dia": len(del_dia), "keys": list(sample.keys()) if sample else [],
-                "sample": sample, "raw_type": "array" if isinstance(data, list) else list(data.keys())}
+                "sample": sample}
         except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
 
 @app.route("/reporte/preview")
 def reporte_preview():
-    """Genera el PDF sin enviar. Acepta ?fecha=YYYY-MM-DD"""
     try:
         fecha_param = request.args.get("fecha")
         hoy_str  = fecha_param or date.today().isoformat()
@@ -565,7 +554,6 @@ def reporte_preview():
 
 @app.route("/reporte/enviar")
 def reporte_enviar():
-    """Genera y envía el PDF. Acepta ?fecha=YYYY-MM-DD"""
     if REPORT_SECRET and request.args.get("secret") != REPORT_SECRET:
         return jsonify({"ok": False, "error": "no autorizado"}), 401
     try:
