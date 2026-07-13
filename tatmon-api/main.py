@@ -648,6 +648,30 @@ def debug_payments():
         except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
 
+@app.route("/debug/pos")
+def debug_pos():
+    """Explora /posOrders de MGR. Acepta ?fecha=YYYY-MM-DD"""
+    fecha = request.args.get("fecha", "2026-07-12")
+    results = {}
+    for nombre, key in TIENDAS_CONFIG.items():
+        if not key: results[nombre] = {"error": "sin key"}; continue
+        headers = {"Authorization": key.strip(), "Accept": "application/json"}
+        try:
+            r = requests.get(f"{MGR_BASE}/posOrders", headers=headers,
+                             params={"page": 1}, timeout=15)
+            data = r.json()
+            batch = data if isinstance(data, list) else (data.get("orders") or data.get("data") or [])
+            sample = batch[0] if batch else {}
+            del_dia = [o for o in batch if fecha in str(o.get("date","") or o.get("created_at","") or o.get("sale_date","") or "")]
+            results[nombre] = {
+                "status": r.status_code, "total_pag1": len(batch),
+                "del_dia": len(del_dia), "keys": list(sample.keys()) if sample else [],
+                "sample": sample, "del_dia_sample": del_dia[:2],
+                "raw_type": "array" if isinstance(data, list) else list(data.keys()) if isinstance(data, dict) else str(type(data))
+            }
+        except Exception as e: results[nombre] = {"error": str(e)}
+    return jsonify(results)
+
 @app.route("/reporte/preview")
 def reporte_preview():
     try:
