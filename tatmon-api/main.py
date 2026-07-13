@@ -335,7 +335,51 @@ def get_dia_kpis(fecha_str):
     ids_ya = {t.get("id") for t in tickets_del_dia}
     tickets_extra = [t for t in tickets_venta_dia if t.get("id") not in ids_ya]
     kpis["_tickets_raw"] = tickets_del_dia + tickets_extra
-    return kpis
+    # Ventas POS del día
+    pos = fetch_pos_dia(fecha_str)
+    kpis["pos_dia"]   = pos
+    kpis["pos_total"] = round(sum(v["total"] for v in pos.values()), 2)
+    kpis["pos_count"] = sum(v["count"] for v in pos.values())
+    return kpis    pos = fetch_pos_dia(fecha_str)
+    kpis["pos_dia"]   = pos
+    kpis["pos_total"] = round(sum(v["total"] for v in pos.values()), 2)
+    kpis["pos_count"] = sum(v["count"] for v in pos.values())
+    return kpisdef fetch_pos_dia(fecha_str):
+    """Obtiene ventas POS del día desde /posOrders por tienda."""
+    resultados = {}
+    for nombre, key in TIENDAS_CONFIG.items():
+        if not key:
+            resultados[nombre] = {"total": 0.0, "count": 0}
+            continue
+        headers = {"Authorization": key.strip(), "Accept": "application/json"}
+        total = 0.0; count = 0; page = 1
+        while True:
+            try:
+                r = requests.get(f"{MGR_BASE}/posOrders", headers=headers,
+                                 params={"page": page}, timeout=15)
+                r.raise_for_status()
+                batch = r.json()
+                if not isinstance(batch, list):
+                    batch = batch.get("orders") or batch.get("data") or []
+                if not batch: break
+                del_dia = [o for o in batch
+                           if date_str(o.get("created_date","")) == fecha_str
+                           and o.get("status") == "Paid"]
+                for o in del_dia:
+                    try: total += float(o.get("amount_total") or 0)
+                    except: pass
+                    count += 1
+                fechas = [date_str(o.get("created_date","")) for o in batch if o.get("created_date")]
+                if fechas and min(fechas) < fecha_str: break
+                if len(batch) < 50: break
+                page += 1; time.sleep(0.2)
+            except Exception as e:
+                print(f"[ERROR] posOrders {nombre} pag {page}: {e}")
+                break
+        resultados[nombre] = {"total": round(total, 2), "count": count}
+        print(f"[INFO] posOrders {nombre} {fecha_str}: total={total} count={count}")
+    return resultados
+
 def fmt_q(valor): return f"Q {valor:,.2f}"
 
 def categorizar_tickets_dia(tickets, fecha_str):
@@ -491,25 +535,24 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     elementos.append(Paragraph(f"Desglose por Categoría — {fecha_str}", titulo_style))
     elementos.append(Spacer(1, 6*mm))
 
-    tickets_raw = data_hoy.get("_tickets_raw", [])
-    cats2 = categorizar_tickets_dia(tickets_raw, fecha_str)
-    tel   = cats2["telefonos"]
-    rep   = cats2["reparaciones"]
-    rev_tel = tel["revenue"]
-    rev_rep = rep["revenue"]
+    tickets_raw    = data_hoy.get("_tickets_raw", [])
+    cats2          = categorizar_tickets_dia(tickets_raw, fecha_str)
+    rep            = cats2["reparaciones"]
+    rev_rep        = rep["revenue"]
     rev_total_real = data_hoy["red"]["revenue"]
-    pct_tel = round(rev_tel / rev_total_real * 100, 1) if rev_total_real else 0
+    rev_pos        = data_hoy.get("pos_total", 0.0)
+    cnt_pos        = data_hoy.get("pos_count", 0)
+    rev_adv        = data_hoy["red"].get("revenue_advance", 0.0)
+    pct_pos = round(rev_pos / rev_total_real * 100, 1) if rev_total_real else 0
     pct_rep = round(rev_rep / rev_total_real * 100, 1) if rev_total_real else 0
-    pct_adv = round(max(100 - pct_tel - pct_rep, 0), 1)
-
+    pct_adv = round(max(100 - pct_pos - pct_rep, 0), 1)
     cat_data = [
-        ["Categoría", "Tickets", "Ingresos (tickets)", "% del total cobrado"],
-        ["Teléfonos",               str(tel["count"]), fmt_q(rev_tel),       f"{pct_tel}%"],
-        ["Reparaciones",             str(rep["count"]), fmt_q(rev_rep),       f"{pct_rep}%"],
-        ["Advances / sin clasificar", "—",              "—",                  f"{pct_adv}%"],
-        ["TOTAL COBRADO",            "—",              fmt_q(rev_total_real), ""],
-    ]
-    cat_table = Table(cat_data, colWidths=[65*mm, 22*mm, 48*mm, 45*mm])
+        ["Categoría", "Órdenes", "Ingresos", "% del total cobrado"],
+        ["Ventas POS (Teléfonos/Accesorios)", str(cnt_pos),       fmt_q(rev_pos),       f"{pct_pos}%"],
+        ["Reparaciones",                      str(rep["count"]),  fmt_q(rev_rep),       f"{pct_rep}%"],
+        ["Advances / Anticipos",              "—",               fmt_q(rev_adv),        f"{pct_adv}%"],
+        ["TOTAL COBRADO",                     "—",               fmt_q(rev_total_real), ""],
+    ]    cat_table = Table(cat_data, colWidths=[65*mm, 22*mm, 48*mm, 45*mm])
     cat_table.setStyle(TableStyle([
         ("BACKGROUND",  (0,0), (-1,0),  NEGRO), ("TEXTCOLOR",  (0,0), (-1,0),  colors.white),
         ("FONTNAME",    (0,0), (-1,0),  "Helvetica-Bold"),
@@ -533,10 +576,9 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     d = Drawing(BAR_W, BAR_H + 20)
     x = 0
     segmentos = [
-        (pct_tel, colors.HexColor("#00A7E1"), f"Teléfonos {pct_tel}%"),
+        (pct_pos, colors.HexColor("#00A7E1"), f"Ventas POS {pct_pos}%"),
         (pct_rep, colors.HexColor("#1E8E3E"), f"Reparaciones {pct_rep}%"),
-        (pct_adv, colors.HexColor("#CCCCCC"), f"Otros {pct_adv}%"),
-    ]
+        (pct_adv, colors.HexColor("#FF6B00"), f"Advances {pct_adv}%"),    ]
     for pct, col, label in segmentos:
         w = BAR_W * pct / 100
         if w < 1: continue
@@ -551,11 +593,12 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     # Detalle por tienda
     elementos.append(Paragraph("Desglose por sucursal", subtitulo_style))
     elementos.append(Spacer(1, 3*mm))
-    det_data = [["Sucursal", "Tickets Teléfonos", "Tickets Reparaciones"]]
+    pos_por_tienda = {n: data_hoy.get("pos_dia", {}).get(n, {}) for n in TIENDAS_CONFIG}
+    det_data = [["Sucursal", "POS (Teléfonos/Acc.)", "Reparaciones", "Total POS"]]
     for tn in sorted(TIENDAS_CONFIG.keys()):
-        det_data.append([tn, str(tel["tiendas"].get(tn, 0)), str(rep["tiendas"].get(tn, 0))])
-    det_table = Table(det_data, colWidths=[80*mm, 45*mm, 55*mm])
-    det_table.setStyle(TableStyle([
+        p = pos_por_tienda.get(tn, {})
+        det_data.append([tn, str(p.get("count", 0)), str(rep["tiendas"].get(tn, 0)), fmt_q(p.get("total", 0.0))])
+    det_table = Table(det_data, colWidths=[65*mm, 40*mm, 40*mm, 35*mm])    det_table.setStyle(TableStyle([
         ("BACKGROUND",     (0,0), (-1,0),  AZUL), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
         ("FONTNAME",       (0,0), (-1,0),  "Helvetica-Bold"),
         ("FONTSIZE",       (0,0), (-1,-1), 9), ("ALIGN", (1,0), (-1,-1), "CENTER"),
