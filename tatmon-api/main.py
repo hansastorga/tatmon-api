@@ -340,11 +340,10 @@ def get_dia_kpis(fecha_str):
     kpis["pos_dia"]   = pos
     kpis["pos_total"] = round(sum(v["total"] for v in pos.values()), 2)
     kpis["pos_count"] = sum(v["count"] for v in pos.values())
-    return kpis    pos = fetch_pos_dia(fecha_str)
-    kpis["pos_dia"]   = pos
-    kpis["pos_total"] = round(sum(v["total"] for v in pos.values()), 2)
-    kpis["pos_count"] = sum(v["count"] for v in pos.values())
-    return kpisdef fetch_pos_dia(fecha_str):
+    return kpis
+    return kpis
+
+def fetch_pos_dia(fecha_str):
     """Obtiene ventas POS del día desde /posOrders por tienda."""
     resultados = {}
     for nombre, key in TIENDAS_CONFIG.items():
@@ -552,7 +551,8 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
         ["Reparaciones",                      str(rep["count"]),  fmt_q(rev_rep),       f"{pct_rep}%"],
         ["Advances / Anticipos",              "—",               fmt_q(rev_adv),        f"{pct_adv}%"],
         ["TOTAL COBRADO",                     "—",               fmt_q(rev_total_real), ""],
-    ]    cat_table = Table(cat_data, colWidths=[65*mm, 22*mm, 48*mm, 45*mm])
+    ]
+    cat_table = Table(cat_data, colWidths=[65*mm, 22*mm, 48*mm, 45*mm])
     cat_table.setStyle(TableStyle([
         ("BACKGROUND",  (0,0), (-1,0),  NEGRO), ("TEXTCOLOR",  (0,0), (-1,0),  colors.white),
         ("FONTNAME",    (0,0), (-1,0),  "Helvetica-Bold"),
@@ -598,7 +598,8 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     for tn in sorted(TIENDAS_CONFIG.keys()):
         p = pos_por_tienda.get(tn, {})
         det_data.append([tn, str(p.get("count", 0)), str(rep["tiendas"].get(tn, 0)), fmt_q(p.get("total", 0.0))])
-    det_table = Table(det_data, colWidths=[65*mm, 40*mm, 40*mm, 35*mm])    det_table.setStyle(TableStyle([
+    det_table = Table(det_data, colWidths=[65*mm, 40*mm, 40*mm, 35*mm])
+    det_table.setStyle(TableStyle([
         ("BACKGROUND",     (0,0), (-1,0),  AZUL), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
         ("FONTNAME",       (0,0), (-1,0),  "Helvetica-Bold"),
         ("FONTSIZE",       (0,0), (-1,-1), 9), ("ALIGN", (1,0), (-1,-1), "CENTER"),
