@@ -31,6 +31,25 @@ TIENDAS_CONFIG = {
     "Tatmon Quetzaltenango": os.environ.get("MGR_API_KEY_XELA", ""),
 }
 
+# Calendario de operación por tienda. weekday(): Lunes=0 ... Domingo=6
+# Kalú y La Villa no aperturan los domingos.
+TIENDA_CALENDARIO = {
+    "Tatmon La Villa":       {"cerrado_dias": [6]},
+    "Tatmon Kalú":           {"cerrado_dias": [6]},
+    "Tatmon Cayalá":         {"cerrado_dias": []},
+    "Tatmon Quiché":         {"cerrado_dias": []},
+    "Tatmon Quetzaltenango": {"cerrado_dias": []},
+}
+
+def tienda_cerrada(nombre_tienda, fecha_str):
+    """True si la tienda no opera ese día según TIENDA_CALENDARIO. fecha_str: 'YYYY-MM-DD'."""
+    try:
+        fecha = date.fromisoformat(fecha_str)
+    except (TypeError, ValueError):
+        return False
+    dias_cerrados = TIENDA_CALENDARIO.get(nombre_tienda, {}).get("cerrado_dias", [])
+    return fecha.weekday() in dias_cerrados
+
 VENTAS_TIPOS = {"venta de equipos.", "compra", "venta", "reserva"}
 EST_TERM = {"Completado", "Finalizado / Entregado", "Facturado"}
 EST_ACT  = {
@@ -58,6 +77,7 @@ ROJO    = colors.HexColor("#D93025")
 AMARILLO   = colors.HexColor("#FFF8E1")
 AZUL_CLARO = colors.HexColor("#E3F4FB")
 VERDE_CLARO = colors.HexColor("#E8F5E9")
+GRIS_CERRADO = colors.HexColor("#888888")
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.jpg")
 
@@ -106,10 +126,28 @@ def cycle_time_hours(ticket):
         return round(diff, 1) if 0 < diff < 720 else None
     except: return None
 
-def classify_ticket(ticket, fecha_str):
-    creado = date_str(ticket.get("created_date", ""))
+def fecha_pago_efectiva(ticket):
+    """Fecha efectiva de pago de un ticket.
+
+    Usa invoice.last_payment_date como fuente principal. Algunas tiendas
+    (confirmado en Tatmon Quetzaltenango/Xela vía /debug/tiendas, donde
+    invoice_keys llega vacío) no exponen ese campo en el invoice aunque el
+    ticket ya esté facturado/completado y cobrado. En ese caso, si el ticket
+    está en un estado terminal (EST_TERM), se usa last_updated como
+    aproximación de la fecha de cobro. Es un fallback heurístico: monitorear
+    que no sobre-clasifique tickets simplemente actualizados (no cobrados).
+    """
     inv    = ticket.get("invoice") or {}
     pagado = date_str(inv.get("last_payment_date", ""))
+    if not pagado:
+        estado = (ticket.get("status") or {}).get("label") or ""
+        if estado in EST_TERM:
+            pagado = date_str(ticket.get("last_updated", ""))
+    return pagado
+
+def classify_ticket(ticket, fecha_str):
+    creado = date_str(ticket.get("created_date", ""))
+    pagado = fecha_pago_efectiva(ticket)
     paid   = bool(pagado)
     if creado == fecha_str and paid and pagado == fecha_str: return "venta_limpia"
     elif creado < fecha_str and paid and pagado == fecha_str: return "cobro_cartera"
@@ -305,8 +343,7 @@ def get_dia_kpis(fecha_str):
     payments = fetch_payments_dia(fecha_str)
     desde_30 = (date.fromisoformat(fecha_str) - timedelta(days=30)).isoformat()
     tickets, _, _ = fetch_all_parallel(desde=desde_30, hasta=fecha_str)
-    tickets_del_dia = [t for t in tickets
-        if date_str((t.get("invoice") or {}).get("last_payment_date", "")) == fecha_str]
+    tickets_del_dia = [t for t in tickets if fecha_pago_efectiva(t) == fecha_str]
     kpis = compute_kpis(tickets_del_dia, fecha_str, fecha_str)
     total_realizados = sum(v["realizados"] for v in payments.values())
     total_advances   = sum(v["advances"]   for v in payments.values())
@@ -340,7 +377,6 @@ def get_dia_kpis(fecha_str):
     kpis["pos_dia"]   = pos
     kpis["pos_total"] = round(sum(v["total"] for v in pos.values()), 2)
     kpis["pos_count"] = sum(v["count"] for v in pos.values())
-    return kpis
     return kpis
 
 def fetch_pos_dia(fecha_str):
@@ -427,6 +463,8 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     pie_style      = ParagraphStyle("pie",        parent=styles["Normal"],  textColor=NARANJA, fontSize=9, alignment=TA_CENTER)
     elementos = []
 
+    ayer_str = (date.fromisoformat(fecha_str) - timedelta(days=1)).isoformat()
+
     # ─── PÁGINA 1 ─────────────────────────────────────────────────────────────
     if os.path.exists(LOGO_PATH):
         elementos.append(Image(LOGO_PATH, width=55*mm, height=26.3*mm))
@@ -501,11 +539,21 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     tabla_data = [["Sucursal", "Hoy", "Ayer", "Variación"]]
     filas_color = []
     for i, nombre in enumerate(nombres, start=1):
+        cerrado_hoy  = tienda_cerrada(nombre, fecha_str)
+        cerrado_ayer = tienda_cerrada(nombre, ayer_str)
         rh = tiendas_hoy_d.get(nombre, {}).get("revenue", 0.0)
         ra = tiendas_ayer_d.get(nombre, {}).get("revenue", 0.0)
-        var = ((rh - ra) / ra * 100) if ra else (100.0 if rh else 0.0)
-        tabla_data.append([nombre, fmt_q(rh), fmt_q(ra), f"{var:+.1f}%"])
-        filas_color.append((i, VERDE if var >= 0 else ROJO))
+        hoy_txt  = "Cerrado" if cerrado_hoy  else fmt_q(rh)
+        ayer_txt = "Cerrado" if cerrado_ayer else fmt_q(ra)
+        if cerrado_hoy or cerrado_ayer:
+            var_txt = "-"
+            color = GRIS_CERRADO
+        else:
+            var = ((rh - ra) / ra * 100) if ra else (100.0 if rh else 0.0)
+            var_txt = f"{var:+.1f}%"
+            color = VERDE if var >= 0 else ROJO
+        tabla_data.append([nombre, hoy_txt, ayer_txt, var_txt])
+        filas_color.append((i, color))
     tabla = Table(tabla_data, colWidths=[70*mm, 35*mm, 35*mm, 30*mm])
     estilo = [
         ("BACKGROUND", (0,0), (-1,0), AZUL), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
@@ -596,6 +644,9 @@ def generar_pdf_reporte(data_hoy, data_ayer, fecha_str):
     pos_por_tienda = {n: data_hoy.get("pos_dia", {}).get(n, {}) for n in TIENDAS_CONFIG}
     det_data = [["Sucursal", "POS (Teléfonos/Acc.)", "Reparaciones", "Total POS"]]
     for tn in sorted(TIENDAS_CONFIG.keys()):
+        if tienda_cerrada(tn, fecha_str):
+            det_data.append([tn, "Cerrado", "-", "-"])
+            continue
         p = pos_por_tienda.get(tn, {})
         det_data.append([tn, str(p.get("count", 0)), str(rep["tiendas"].get(tn, 0)), fmt_q(p.get("total", 0.0))])
     det_table = Table(det_data, colWidths=[65*mm, 40*mm, 40*mm, 35*mm])
@@ -632,7 +683,7 @@ def enviar_reporte_email(pdf_buffer, fecha_str):
 @app.route("/")
 def health():
     keys_ok = sum(1 for k in TIENDAS_CONFIG.values() if k)
-    return jsonify({"status": "ok", "service": "Tatmon API", "version": "4.9",
+    return jsonify({"status": "ok", "service": "Tatmon API", "version": "4.11",
                     "tiendas_configuradas": keys_ok, "ventana_dias": DIAS_VENTANA,
                     "tiendas": {n: "✓" if k else "✗" for n, k in TIENDAS_CONFIG.items()}})
 
