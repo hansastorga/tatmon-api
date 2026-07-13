@@ -1,5 +1,6 @@
 import os, time, io, smtplib, requests
 from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -49,6 +50,15 @@ def tienda_cerrada(nombre_tienda, fecha_str):
         return False
     dias_cerrados = TIENDA_CALENDARIO.get(nombre_tienda, {}).get("cerrado_dias", [])
     return fecha.weekday() in dias_cerrados
+
+TZ_GT = ZoneInfo("America/Guatemala")
+
+def hoy_gt():
+    """Fecha actual en horario de Guatemala. Railway corre el contenedor en UTC,
+    así que date.today() a las 9pm GT (03:00 UTC) ya devuelve el día siguiente.
+    El cron nocturno de GitHub Actions llama /reporte/enviar sin ?fecha=, por lo
+    que depende de esta función para calcular "hoy" correctamente."""
+    return datetime.now(TZ_GT).date()
 
 VENTAS_TIPOS = {"venta de equipos.", "compra", "venta", "reserva"}
 EST_TERM = {"Completado", "Finalizado / Entregado", "Facturado"}
@@ -185,8 +195,8 @@ def fetch_all_parallel(dias=None, desde=None, hasta=None):
         desde_str = desde; hasta_str = hasta
     else:
         d = int(dias) if dias else DIAS_VENTANA
-        hasta_str = date.today().isoformat()
-        desde_str = (date.today() - timedelta(days=d)).isoformat()
+        hasta_str = hoy_gt().isoformat()
+        desde_str = (hoy_gt() - timedelta(days=d)).isoformat()
     all_tickets = []
     with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {ex.submit(fetch_tickets_for_tienda_rango, n, k, desde_str, hasta_str): n
@@ -198,9 +208,9 @@ def fetch_all_parallel(dias=None, desde=None, hasta=None):
     return all_tickets, desde_str, hasta_str
 
 def compute_kpis(tickets, desde_str=None, hasta_str=None):
-    fecha_ref = desde_str or date.today().isoformat()
-    desde     = desde_str or (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
-    hasta     = hasta_str or date.today().isoformat()
+    fecha_ref = desde_str or hoy_gt().isoformat()
+    desde     = desde_str or (hoy_gt() - timedelta(days=DIAS_VENTANA)).isoformat()
+    hasta     = hasta_str or hoy_gt().isoformat()
     tiendas   = {}
     cats      = {"venta_limpia":[], "cobro_cartera":[], "pipeline_sin_cobrar":[]}
     for t in tickets:
@@ -771,7 +781,7 @@ def debug_pos():
 def reporte_preview():
     try:
         fecha_param = request.args.get("fecha")
-        hoy_str  = fecha_param or date.today().isoformat()
+        hoy_str  = fecha_param or hoy_gt().isoformat()
         ayer_str = (date.fromisoformat(hoy_str) - timedelta(days=1)).isoformat()
         data_hoy  = get_dia_kpis(hoy_str)
         data_ayer = get_dia_kpis(ayer_str)
@@ -786,7 +796,7 @@ def reporte_enviar():
         return jsonify({"ok": False, "error": "no autorizado"}), 401
     try:
         fecha_param = request.args.get("fecha")
-        hoy_str  = fecha_param or date.today().isoformat()
+        hoy_str  = fecha_param or hoy_gt().isoformat()
         ayer_str = (date.fromisoformat(hoy_str) - timedelta(days=1)).isoformat()
         data_hoy  = get_dia_kpis(hoy_str)
         data_ayer = get_dia_kpis(ayer_str)
