@@ -349,6 +349,97 @@ def fetch_payments_dia(fecha_str):
         print(f"[INFO] payments {nombre} {fecha_str}: realizados={realizados} advances={advances} count={count}")
     return resultados
 
+def fetch_payments_dia_raw(fecha_str):
+    """Como fetch_payments_dia pero retorna los registros crudos (no solo sumas), para
+    poder conciliar cada pago contra el ticket que lo originó."""
+    resultados = {}
+    for nombre, key in TIENDAS_CONFIG.items():
+        if not key:
+            resultados[nombre] = []
+            continue
+        headers = {"Authorization": key.strip(), "Accept": "application/json"}
+        pagos_dia = []
+        page = 1
+        while True:
+            try:
+                r = requests.get(f"{MGR_BASE}/payments", headers=headers,
+                                 params={"page": page}, timeout=15)
+                r.raise_for_status()
+                batch = r.json()
+                if not isinstance(batch, list):
+                    batch = batch.get("payments") or batch.get("data") or []
+                if not batch: break
+                del_dia = [p for p in batch if date_str(p.get("date","")) == fecha_str]
+                for p in del_dia: p["_tienda"] = nombre
+                pagos_dia.extend(del_dia)
+                fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
+                if fechas and min(fechas) < fecha_str: break
+                if len(batch) < 50: break
+                page += 1; time.sleep(0.2)
+            except Exception as e:
+                print(f"[ERROR] payments_raw {nombre} pag {page}: {e}")
+                break
+        resultados[nombre] = pagos_dia
+    return resultados
+
+def reconciliar_pagos_tickets(fecha_str, ventana_dias=90):
+    """Concilia cada pago de /payments contra el ticket cuyo invoice.last_payment_date
+    coincide exactamente (misma tienda, mismo timestamp al segundo). No existe un campo
+    de ID compartido entre /payments e invoice.number — se confirmó vía /debug/tiendas y
+    /debug/payments que /payments no trae number/ticket_id/invoice_id, solo id y payment_id
+    en formatos que no corresponden a invoice.number. El timestamp es el único cruce viable.
+
+    Clasifica cada pago conciliado como:
+      - venta_dia: el ticket asociado fue creado el mismo fecha_str
+      - cartera:   el ticket asociado fue creado antes de fecha_str
+      - sin_match: no se encontró ningún ticket con ese timestamp exacto (revisar manualmente)
+    """
+    pagos_por_tienda = fetch_payments_dia_raw(fecha_str)
+    desde = (date.fromisoformat(fecha_str) - timedelta(days=ventana_dias)).isoformat()
+    tickets, _, _ = fetch_all_parallel(desde=desde, hasta=fecha_str)
+
+    idx = {}
+    for t in tickets:
+        ts = (t.get("invoice") or {}).get("last_payment_date")
+        if not ts: continue
+        idx.setdefault((t.get("_tienda"), ts), []).append(t)
+
+    venta_dia = {"count": 0, "revenue": 0.0}
+    cartera   = {"count": 0, "revenue": 0.0}
+    sin_match = {"count": 0, "revenue": 0.0, "detalle": []}
+
+    for tienda, pagos in pagos_por_tienda.items():
+        for p in pagos:
+            monto = float(p.get("amount") or 0)
+            candidatos = idx.get((tienda, p.get("date")), [])
+            if not candidatos:
+                sin_match["count"]   += 1
+                sin_match["revenue"] += monto
+                sin_match["detalle"].append({"tienda": tienda, "payment_id": p.get("payment_id"),
+                    "monto": monto, "date": p.get("date"), "is_advance": p.get("is_advance")})
+                continue
+            creado = date_str(candidatos[0].get("created_date", ""))
+            destino = venta_dia if creado == fecha_str else cartera
+            destino["count"] += 1; destino["revenue"] += monto
+
+    cxc_tickets = [t for t in tickets
+                   if date_str(t.get("created_date", "")) == fecha_str
+                   and not (t.get("invoice") or {}).get("last_payment_date")]
+
+    for cat in (venta_dia, cartera, sin_match): cat["revenue"] = round(cat["revenue"], 2)
+    return {
+        "fecha": fecha_str,
+        "venta_dia": venta_dia,
+        "cartera_recuperada": cartera,
+        "sin_match": sin_match,
+        "cuentas_por_cobrar": {
+            "count": len(cxc_tickets),
+            "revenue_estimado": round(sum(parse_total(t) for t in cxc_tickets), 2),
+            "nota": "revenue_estimado usa parse_total() (regex sobre descripción) porque invoice no trae monto — no es confiable, solo referencia"
+        },
+        "total_pagos_del_dia": sum(len(p) for p in pagos_por_tienda.values()),
+    }
+
 def get_dia_kpis(fecha_str):
     payments = fetch_payments_dia(fecha_str)
     desde_30 = (date.fromisoformat(fecha_str) - timedelta(days=30)).isoformat()
@@ -776,6 +867,29 @@ def debug_pos():
             }
         except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
+
+@app.route("/debug/reconciliacion")
+def debug_reconciliacion():
+    """Compara el método viejo (clasificación por ticket, monto vía parse_total) contra
+    el método nuevo (clasificación por pago real de /payments, conciliado por timestamp
+    contra el ticket). Usar para validar antes de reemplazar get_dia_kpis()."""
+    fecha = request.args.get("fecha", "2026-07-16")
+    try:
+        nuevo = reconciliar_pagos_tickets(fecha)
+        viejo = get_dia_kpis(fecha)
+        return jsonify({
+            "fecha": fecha,
+            "metodo_nuevo": nuevo,
+            "metodo_viejo": {
+                "tickets_total": viejo["red"]["total"],
+                "venta_limpia":        viejo["categorias_dia"]["venta_limpia"],
+                "cobro_cartera":       viejo["categorias_dia"]["cobro_cartera"],
+                "pipeline_sin_cobrar": viejo["categorias_dia"]["pipeline_sin_cobrar"],
+                "revenue_total": viejo["red"]["revenue"],
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/reporte/preview")
 def reporte_preview():
