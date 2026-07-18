@@ -32,6 +32,34 @@ TIENDAS_CONFIG = {
     "Tatmon Quetzaltenango": os.environ.get("MGR_API_KEY_XELA", ""),
 }
 
+# Registro de fallos persistentes (tras agotar reintentos) durante el fetch más reciente.
+# No hay acceso directo a logs de Railway desde aquí, así que esto es la única forma de
+# saber si un reporte se generó con datos incompletos por errores transitorios de MGR.
+FETCH_ERRORS = []
+
+def _registrar_error(contexto, detalle):
+    FETCH_ERRORS.append({"ts": datetime.now(timezone.utc).isoformat(), "contexto": contexto, "detalle": str(detalle)})
+    if len(FETCH_ERRORS) > 200: del FETCH_ERRORS[:len(FETCH_ERRORS)-200]
+
+def mgr_get(path, headers, params=None, timeout=15, contexto="", retries=3, backoff=1.5):
+    """GET a la API de MGR con reintentos ante errores transitorios (429, 5xx, timeouts,
+    conexión). Si se agotan los reintentos, registra el fallo en FETCH_ERRORS y relanza
+    la excepción — nunca debe interpretarse silenciosamente como "no hay más datos"."""
+    ultimo_error = None
+    for intento in range(1, retries + 1):
+        try:
+            r = requests.get(f"{MGR_BASE}{path}", headers=headers, params=params, timeout=timeout)
+            if r.status_code == 429 or r.status_code >= 500:
+                raise requests.HTTPError(f"status {r.status_code} en intento {intento}/{retries}", response=r)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            ultimo_error = e
+            if intento < retries:
+                time.sleep(backoff * intento)
+    _registrar_error(contexto, ultimo_error)
+    raise ultimo_error
+
 # Calendario de operación por tienda. weekday(): Lunes=0 ... Domingo=6
 # Kalú y La Villa no aperturan los domingos.
 TIENDA_CALENDARIO = {
@@ -171,21 +199,20 @@ def fetch_tickets_for_tienda_rango(nombre, api_key, desde_str, hasta_str):
     headers = {"Authorization": api_key.strip(), "Accept": "application/json"}
     while True:
         try:
-            r = requests.get(f"{MGR_BASE}/tickets", headers=headers, params={"page": page}, timeout=15)
-            r.raise_for_status()
-            data  = r.json()
-            batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
-            if not batch: break
-            for t in batch: t["_tienda"] = nombre
-            all_tickets.extend(batch)
-            fechas = [date_str(t.get("created_date","")) for t in batch if t.get("created_date")]
-            if fechas and min(fechas) < desde_str: break
-            if len(batch) < 50: break
-            page += 1
-            time.sleep(0.3)
+            r = mgr_get("/tickets", headers, params={"page": page}, contexto=f"tickets {nombre} pag {page}")
         except Exception as e:
-            print(f"[ERROR] {nombre} pag {page}: {e}")
+            print(f"[FALLO PERSISTENTE] tickets {nombre} pag {page} tras reintentos: {e} — ventana posiblemente incompleta")
             break
+        data  = r.json()
+        batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
+        if not batch: break
+        for t in batch: t["_tienda"] = nombre
+        all_tickets.extend(batch)
+        fechas = [date_str(t.get("created_date","")) for t in batch if t.get("created_date")]
+        if fechas and min(fechas) < desde_str: break
+        if len(batch) < 50: break
+        page += 1
+        time.sleep(0.3)
     en_ventana = [t for t in all_tickets if t.get("created_date") and desde_str <= date_str(t["created_date"]) <= hasta_str]
     print(f"[INFO] {nombre}: {len(en_ventana)} tickets ({desde_str} to {hasta_str})")
     return nombre, en_ventana
@@ -324,26 +351,24 @@ def fetch_payments_dia(fecha_str):
         count = 0; page = 1
         while True:
             try:
-                r = requests.get(f"{MGR_BASE}/payments", headers=headers,
-                                 params={"page": page}, timeout=15)
-                r.raise_for_status()
-                batch = r.json()
-                if not isinstance(batch, list):
-                    batch = batch.get("payments") or batch.get("data") or []
-                if not batch: break
-                del_dia = [p for p in batch if date_str(p.get("date","")) == fecha_str]
-                for p in del_dia:
-                    monto = float(p.get("amount") or 0)
-                    if p.get("is_advance"): advances   += monto
-                    else:                   realizados += monto
-                    count += 1
-                fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
-                if fechas and min(fechas) < fecha_str: break
-                if len(batch) < 50: break
-                page += 1; time.sleep(0.2)
+                r = mgr_get("/payments", headers, params={"page": page}, contexto=f"payments {nombre} pag {page}")
             except Exception as e:
-                print(f"[ERROR] payments {nombre} pag {page}: {e}")
+                print(f"[FALLO PERSISTENTE] payments {nombre} pag {page} tras reintentos: {e} — total del día posiblemente incompleto")
                 break
+            batch = r.json()
+            if not isinstance(batch, list):
+                batch = batch.get("payments") or batch.get("data") or []
+            if not batch: break
+            del_dia = [p for p in batch if date_str(p.get("date","")) == fecha_str]
+            for p in del_dia:
+                monto = float(p.get("amount") or 0)
+                if p.get("is_advance"): advances   += monto
+                else:                   realizados += monto
+                count += 1
+            fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
+            if fechas and min(fechas) < fecha_str: break
+            if len(batch) < 50: break
+            page += 1; time.sleep(0.2)
         resultados[nombre] = {"realizados": round(realizados, 2),
             "advances": round(advances, 2), "total": round(realizados + advances, 2), "count": count}
         print(f"[INFO] payments {nombre} {fecha_str}: realizados={realizados} advances={advances} count={count}")
@@ -362,23 +387,21 @@ def fetch_payments_dia_raw(fecha_str):
         page = 1
         while True:
             try:
-                r = requests.get(f"{MGR_BASE}/payments", headers=headers,
-                                 params={"page": page}, timeout=15)
-                r.raise_for_status()
-                batch = r.json()
-                if not isinstance(batch, list):
-                    batch = batch.get("payments") or batch.get("data") or []
-                if not batch: break
-                del_dia = [p for p in batch if date_str(p.get("date","")) == fecha_str]
-                for p in del_dia: p["_tienda"] = nombre
-                pagos_dia.extend(del_dia)
-                fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
-                if fechas and min(fechas) < fecha_str: break
-                if len(batch) < 50: break
-                page += 1; time.sleep(0.2)
+                r = mgr_get("/payments", headers, params={"page": page}, contexto=f"payments_raw {nombre} pag {page}")
             except Exception as e:
-                print(f"[ERROR] payments_raw {nombre} pag {page}: {e}")
+                print(f"[FALLO PERSISTENTE] payments_raw {nombre} pag {page} tras reintentos: {e} — lista del día posiblemente incompleta")
                 break
+            batch = r.json()
+            if not isinstance(batch, list):
+                batch = batch.get("payments") or batch.get("data") or []
+            if not batch: break
+            del_dia = [p for p in batch if date_str(p.get("date","")) == fecha_str]
+            for p in del_dia: p["_tienda"] = nombre
+            pagos_dia.extend(del_dia)
+            fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
+            if fechas and min(fechas) < fecha_str: break
+            if len(batch) < 50: break
+            page += 1; time.sleep(0.2)
         resultados[nombre] = pagos_dia
     return resultados
 
@@ -464,25 +487,27 @@ def fetch_invoice_details_for_tickets(tickets):
         t, tienda, key, inv_id = item
         headers = {"Authorization": key.strip(), "Accept": "application/json"}
         try:
-            r = requests.get(f"{MGR_BASE}/ticketInvoices/{inv_id}", headers=headers, timeout=15)
-            r.raise_for_status()
+            r = mgr_get(f"/ticketInvoices/{inv_id}", headers, contexto=f"ticketInvoices {tienda} {inv_id}")
             body = r.json()
             facturas = body if isinstance(body, list) else [body]
             return t, (facturas[0] if facturas else {})
         except Exception as e:
-            print(f"[ERROR] ticketInvoices {tienda} {inv_id}: {e}")
+            print(f"[FALLO PERSISTENTE] ticketInvoices {tienda} {inv_id} tras reintentos: {e}")
             return t, {}
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = [ex.submit(_fetch, item) for item in tareas]
+        fallidos = 0
         for f in as_completed(futures):
             t, factura = f.result()
-            if not factura: continue
+            if not factura:
+                fallidos += 1
+                continue
             detalle_por_ticket[t.get("id")] = factura
             for p in factura.get("payments") or []:
                 pid = p.get("id")
                 if pid: idx_pago_ticket[pid] = t
-    return idx_pago_ticket, detalle_por_ticket
+    return idx_pago_ticket, detalle_por_ticket, fallidos, len(tareas)
 
 def reconciliar_pagos_tickets_v2(fecha_str, ventana_dias=60):
     """Clasifica los pagos reales del día contra el ticket que los originó, usando el
@@ -493,7 +518,7 @@ def reconciliar_pagos_tickets_v2(fecha_str, ventana_dias=60):
     pagos_por_tienda = fetch_payments_dia_raw(fecha_str)
     desde = (date.fromisoformat(fecha_str) - timedelta(days=ventana_dias)).isoformat()
     tickets, _, _ = fetch_all_parallel(desde=desde, hasta=fecha_str)
-    idx_pago_ticket, detalle_por_ticket = fetch_invoice_details_for_tickets(tickets)
+    idx_pago_ticket, detalle_por_ticket, fallidos, total_facturas = fetch_invoice_details_for_tickets(tickets)
 
     venta_dia = {"count": 0, "revenue": 0.0}
     cartera   = {"count": 0, "revenue": 0.0}
@@ -532,6 +557,8 @@ def reconciliar_pagos_tickets_v2(fecha_str, ventana_dias=60):
         },
         "total_pagos_del_dia": sum(len(p) for p in pagos_por_tienda.values()),
         "tickets_en_ventana": len(tickets),
+        "facturas_fallidas": fallidos,
+        "facturas_totales": total_facturas,
         "segundos": round(time.time() - t0, 1),
     }
 
@@ -586,27 +613,25 @@ def fetch_pos_dia(fecha_str):
         total = 0.0; count = 0; page = 1
         while True:
             try:
-                r = requests.get(f"{MGR_BASE}/posOrders", headers=headers,
-                                 params={"page": page}, timeout=15)
-                r.raise_for_status()
-                batch = r.json()
-                if not isinstance(batch, list):
-                    batch = batch.get("orders") or batch.get("data") or []
-                if not batch: break
-                del_dia = [o for o in batch
-                           if date_str(o.get("created_date","")) == fecha_str
-                           and o.get("status") == "Paid"]
-                for o in del_dia:
-                    try: total += float(o.get("amount_total") or 0)
-                    except: pass
-                    count += 1
-                fechas = [date_str(o.get("created_date","")) for o in batch if o.get("created_date")]
-                if fechas and min(fechas) < fecha_str: break
-                if len(batch) < 50: break
-                page += 1; time.sleep(0.2)
+                r = mgr_get("/posOrders", headers, params={"page": page}, contexto=f"posOrders {nombre} pag {page}")
             except Exception as e:
-                print(f"[ERROR] posOrders {nombre} pag {page}: {e}")
+                print(f"[FALLO PERSISTENTE] posOrders {nombre} pag {page} tras reintentos: {e} — total POS del día posiblemente incompleto")
                 break
+            batch = r.json()
+            if not isinstance(batch, list):
+                batch = batch.get("orders") or batch.get("data") or []
+            if not batch: break
+            del_dia = [o for o in batch
+                       if date_str(o.get("created_date","")) == fecha_str
+                       and o.get("status") == "Paid"]
+            for o in del_dia:
+                try: total += float(o.get("amount_total") or 0)
+                except: pass
+                count += 1
+            fechas = [date_str(o.get("created_date","")) for o in batch if o.get("created_date")]
+            if fechas and min(fechas) < fecha_str: break
+            if len(batch) < 50: break
+            page += 1; time.sleep(0.2)
         resultados[nombre] = {"total": round(total, 2), "count": count}
         print(f"[INFO] posOrders {nombre} {fecha_str}: total={total} count={count}")
     return resultados
@@ -962,6 +987,13 @@ def debug_pos():
             }
         except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
+
+@app.route("/debug/errores")
+def debug_errores():
+    """Fallos persistentes (tras agotar reintentos) del fetch más reciente contra MGR.
+    No hay acceso a logs de Railway desde aquí — este es el único rastro de si un
+    reporte/consulta se generó con datos incompletos por errores transitorios."""
+    return jsonify({"total": len(FETCH_ERRORS), "errores": FETCH_ERRORS[-100:]})
 
 @app.route("/debug/invoice")
 def debug_invoice():
