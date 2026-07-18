@@ -868,6 +868,23 @@ def debug_pos():
         except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
 
+@app.route("/debug/invoice")
+def debug_invoice():
+    """Explora GET /ticketInvoices/{invoiceId} de MGR — endpoint sin probar hasta ahora.
+    Puede traer el detalle de pagos asociados a una factura (el campo de conciliación
+    que /tickets y /payments no comparten directamente). Uso: ?tienda=NOMBRE&invoice_id=UUID"""
+    tienda = request.args.get("tienda", "")
+    invoice_id = request.args.get("invoice_id", "")
+    key = TIENDAS_CONFIG.get(tienda, "")
+    if not key: return jsonify({"error": f"tienda desconocida o sin key: {tienda}", "tiendas_validas": list(TIENDAS_CONFIG.keys())}), 400
+    if not invoice_id: return jsonify({"error": "falta invoice_id"}), 400
+    headers = {"Authorization": key.strip(), "Accept": "application/json"}
+    try:
+        r = requests.get(f"{MGR_BASE}/ticketInvoices/{invoice_id}", headers=headers, timeout=15)
+        return jsonify({"status": r.status_code, "body": r.json() if r.content else None})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/debug/reconciliacion")
 def debug_reconciliacion():
     """Compara el método viejo (clasificación por ticket, monto vía parse_total) contra
