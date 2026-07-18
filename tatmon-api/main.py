@@ -885,6 +885,26 @@ def debug_invoice():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/debug/invoices_list")
+def debug_invoices_list():
+    """Explora GET /ticketInvoices/ (lista, sin ID) — para ver si ya trae el array
+    'payments' embebido por factura sin necesidad de N+1 llamadas por ticket."""
+    tienda = request.args.get("tienda", "")
+    page = request.args.get("page", "1")
+    key = TIENDAS_CONFIG.get(tienda, "")
+    if not key: return jsonify({"error": f"tienda desconocida o sin key: {tienda}", "tiendas_validas": list(TIENDAS_CONFIG.keys())}), 400
+    headers = {"Authorization": key.strip(), "Accept": "application/json"}
+    try:
+        r = requests.get(f"{MGR_BASE}/ticketInvoices/", headers=headers, params={"page": page}, timeout=15)
+        data = r.json() if r.content else None
+        batch = data if isinstance(data, list) else (data.get("invoices") or data.get("data") or []) if isinstance(data, dict) else []
+        sample = batch[0] if batch else {}
+        return jsonify({"status": r.status_code, "count": len(batch),
+            "raw_type": "array" if isinstance(data, list) else list(data.keys()) if isinstance(data, dict) else str(type(data)),
+            "sample_keys": list(sample.keys()) if sample else [], "sample": sample})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/debug/reconciliacion")
 def debug_reconciliacion():
     """Compara el método viejo (clasificación por ticket, monto vía parse_total) contra
