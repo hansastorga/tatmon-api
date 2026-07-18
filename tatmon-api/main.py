@@ -440,6 +440,101 @@ def reconciliar_pagos_tickets(fecha_str, ventana_dias=90):
         "total_pagos_del_dia": sum(len(p) for p in pagos_por_tienda.values()),
     }
 
+def fetch_invoice_details_for_tickets(tickets):
+    """Para cada ticket con invoice, llama GET /ticketInvoices/{invoice.id} (threaded) y
+    devuelve (idx_pago_a_ticket, detalle_por_ticket_id).
+
+    Confirmado que este es el único camino de conciliación real: /ticketInvoices/{id}
+    trae un array 'payments' embebido cuyos id/payment_id coinciden exactamente con los
+    registros de /payments — algo que /tickets y /payments no comparten directamente
+    (ver /debug/invoice, /debug/payment_detail). No existe /payments/{id} (404) ni ningún
+    otro atajo inverso, así que hay que recorrer las facturas de los tickets en la ventana.
+    """
+    idx_pago_ticket = {}
+    detalle_por_ticket = {}
+    tareas = []
+    for t in tickets:
+        inv_id = (t.get("invoice") or {}).get("id")
+        tienda = t.get("_tienda")
+        key = TIENDAS_CONFIG.get(tienda, "")
+        if inv_id and key:
+            tareas.append((t, tienda, key, inv_id))
+
+    def _fetch(item):
+        t, tienda, key, inv_id = item
+        headers = {"Authorization": key.strip(), "Accept": "application/json"}
+        try:
+            r = requests.get(f"{MGR_BASE}/ticketInvoices/{inv_id}", headers=headers, timeout=15)
+            r.raise_for_status()
+            body = r.json()
+            facturas = body if isinstance(body, list) else [body]
+            return t, (facturas[0] if facturas else {})
+        except Exception as e:
+            print(f"[ERROR] ticketInvoices {tienda} {inv_id}: {e}")
+            return t, {}
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(_fetch, item) for item in tareas]
+        for f in as_completed(futures):
+            t, factura = f.result()
+            if not factura: continue
+            detalle_por_ticket[t.get("id")] = factura
+            for p in factura.get("payments") or []:
+                pid = p.get("id")
+                if pid: idx_pago_ticket[pid] = t
+    return idx_pago_ticket, detalle_por_ticket
+
+def reconciliar_pagos_tickets_v2(fecha_str, ventana_dias=60):
+    """Clasifica los pagos reales del día contra el ticket que los originó, usando el
+    índice construido desde /ticketInvoices/{id} (ver fetch_invoice_details_for_tickets),
+    en vez de adivinar por timestamp (reconciliar_pagos_tickets, que falla ~78% de las
+    veces — ver /debug/reconciliacion)."""
+    t0 = time.time()
+    pagos_por_tienda = fetch_payments_dia_raw(fecha_str)
+    desde = (date.fromisoformat(fecha_str) - timedelta(days=ventana_dias)).isoformat()
+    tickets, _, _ = fetch_all_parallel(desde=desde, hasta=fecha_str)
+    idx_pago_ticket, detalle_por_ticket = fetch_invoice_details_for_tickets(tickets)
+
+    venta_dia = {"count": 0, "revenue": 0.0}
+    cartera   = {"count": 0, "revenue": 0.0}
+    sin_match = {"count": 0, "revenue": 0.0, "detalle": []}
+
+    for tienda, pagos in pagos_por_tienda.items():
+        for p in pagos:
+            monto  = float(p.get("amount") or 0)
+            ticket = idx_pago_ticket.get(p.get("id"))
+            if not ticket:
+                sin_match["count"]   += 1
+                sin_match["revenue"] += monto
+                sin_match["detalle"].append({"tienda": tienda, "payment_id": p.get("payment_id"),
+                    "id": p.get("id"), "monto": monto, "date": p.get("date"), "is_advance": p.get("is_advance")})
+                continue
+            creado  = date_str(ticket.get("created_date", ""))
+            destino = venta_dia if creado == fecha_str else cartera
+            destino["count"] += 1; destino["revenue"] += monto
+
+    cxc_tickets = [t for t in tickets if date_str(t.get("created_date", "")) == fecha_str]
+    cxc_pendientes = []
+    for t in cxc_tickets:
+        factura = detalle_por_ticket.get(t.get("id"), {})
+        if not factura or factura.get("status") != "Paid":
+            cxc_pendientes.append((t, factura))
+
+    for cat in (venta_dia, cartera, sin_match): cat["revenue"] = round(cat["revenue"], 2)
+    return {
+        "fecha": fecha_str,
+        "venta_dia": venta_dia,
+        "cartera_recuperada": cartera,
+        "sin_match": sin_match,
+        "cuentas_por_cobrar": {
+            "count": len(cxc_pendientes),
+            "revenue": round(sum(float((f.get("amount_total") or 0)) for _, f in cxc_pendientes), 2),
+        },
+        "total_pagos_del_dia": sum(len(p) for p in pagos_por_tienda.values()),
+        "tickets_en_ventana": len(tickets),
+        "segundos": round(time.time() - t0, 1),
+    }
+
 def get_dia_kpis(fecha_str):
     payments = fetch_payments_dia(fecha_str)
     desde_30 = (date.fromisoformat(fecha_str) - timedelta(days=30)).isoformat()
@@ -920,6 +1015,16 @@ def debug_invoices_list():
         return jsonify({"status": r.status_code, "count": len(batch),
             "raw_type": "array" if isinstance(data, list) else list(data.keys()) if isinstance(data, dict) else str(type(data)),
             "sample_keys": list(sample.keys()) if sample else [], "sample": sample})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/debug/reconciliacion_v2")
+def debug_reconciliacion_v2():
+    """Versión validada: conciliación por /ticketInvoices/{id} en vez de timestamp."""
+    fecha = request.args.get("fecha", "2026-07-16")
+    ventana = int(request.args.get("ventana_dias", "60"))
+    try:
+        return jsonify(reconciliar_pagos_tickets_v2(fecha, ventana_dias=ventana))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
