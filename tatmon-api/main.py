@@ -988,6 +988,32 @@ def debug_pos():
         except Exception as e: results[nombre] = {"error": str(e)}
     return jsonify(results)
 
+@app.route("/debug/tickets_pages")
+def debug_tickets_pages():
+    """Inspecciona páginas crudas de GET /tickets para verificar si realmente vienen
+    ordenadas por created_date descendente (supuesto del que depende el corte de
+    paginación en fetch_tickets_for_tienda_rango). Uso: ?tienda=NOMBRE&paginas=5"""
+    tienda = request.args.get("tienda", "")
+    n_paginas = int(request.args.get("paginas", "5"))
+    key = TIENDAS_CONFIG.get(tienda, "")
+    if not key: return jsonify({"error": f"tienda desconocida o sin key: {tienda}"}), 400
+    headers = {"Authorization": key.strip(), "Accept": "application/json"}
+    paginas = []
+    for page in range(1, n_paginas + 1):
+        try:
+            r = requests.get(f"{MGR_BASE}/tickets", headers=headers, params={"page": page}, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
+            fechas = [date_str(t.get("created_date","")) for t in batch if t.get("created_date")]
+            ids = [t.get("id") for t in batch[:3]]
+            paginas.append({"page": page, "count": len(batch), "primera_fecha": fechas[0] if fechas else None,
+                "ultima_fecha": fechas[-1] if fechas else None, "min_fecha": min(fechas) if fechas else None,
+                "max_fecha": max(fechas) if fechas else None, "primeros_ids": ids})
+        except Exception as e:
+            paginas.append({"page": page, "error": str(e)})
+    return jsonify({"tienda": tienda, "paginas": paginas})
+
 @app.route("/debug/errores")
 def debug_errores():
     """Fallos persistentes (tras agotar reintentos) del fetch más reciente contra MGR.
