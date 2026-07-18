@@ -874,8 +874,9 @@ def debug_reconciliacion():
     el método nuevo (clasificación por pago real de /payments, conciliado por timestamp
     contra el ticket). Usar para validar antes de reemplazar get_dia_kpis()."""
     fecha = request.args.get("fecha", "2026-07-16")
+    ventana = int(request.args.get("ventana_dias", "90"))
     try:
-        nuevo = reconciliar_pagos_tickets(fecha)
+        nuevo = reconciliar_pagos_tickets(fecha, ventana_dias=ventana)
         viejo = get_dia_kpis(fecha)
         return jsonify({
             "fecha": fecha,
