@@ -885,6 +885,24 @@ def debug_invoice():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/debug/payment_detail")
+def debug_payment_detail():
+    """Prueba si GET /payments/{paymentId} existe y si retorna un link directo a
+    ticket/invoice (más eficiente que recorrer facturas una por una)."""
+    tienda = request.args.get("tienda", "")
+    payment_id = request.args.get("payment_id", "")
+    key = TIENDAS_CONFIG.get(tienda, "")
+    if not key: return jsonify({"error": f"tienda desconocida o sin key: {tienda}"}), 400
+    headers = {"Authorization": key.strip(), "Accept": "application/json"}
+    intentos = {}
+    for path in (f"/payments/{payment_id}", f"/ticketPayments/{payment_id}"):
+        try:
+            r = requests.get(f"{MGR_BASE}{path}", headers=headers, timeout=15)
+            intentos[path] = {"status": r.status_code, "body": r.json() if r.content else None}
+        except Exception as e:
+            intentos[path] = {"error": str(e)}
+    return jsonify(intentos)
+
 @app.route("/debug/invoices_list")
 def debug_invoices_list():
     """Explora GET /ticketInvoices/ (lista, sin ID) — para ver si ya trae el array
