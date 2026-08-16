@@ -192,16 +192,21 @@ def classify_ticket(ticket, fecha_str):
     elif creado == fecha_str and not paid: return "pipeline_sin_cobrar"
     return "otro"
 
+PAGE_SIZE = 50
+
 def fetch_tickets_for_tienda_rango(nombre, api_key, desde_str, hasta_str):
+    """Pagina /tickets con offset/limit — NO usar 'page', MGR lo ignora y siempre
+    devuelve vacío más allá del primer bloque (confirmado en /debug/paginacion:
+    offset=50 trae 50 tickets nuevos y distintos, page=2 siempre viene vacío)."""
     if not api_key: return nombre, []
     all_tickets = []
-    page = 1
+    offset = 0
     headers = {"Authorization": api_key.strip(), "Accept": "application/json"}
     while True:
         try:
-            r = mgr_get("/tickets", headers, params={"page": page}, contexto=f"tickets {nombre} pag {page}")
+            r = mgr_get("/tickets", headers, params={"limit": PAGE_SIZE, "offset": offset}, contexto=f"tickets {nombre} offset {offset}")
         except Exception as e:
-            print(f"[FALLO PERSISTENTE] tickets {nombre} pag {page} tras reintentos: {e} — ventana posiblemente incompleta")
+            print(f"[FALLO PERSISTENTE] tickets {nombre} offset {offset} tras reintentos: {e} — ventana posiblemente incompleta")
             break
         data  = r.json()
         batch = data if isinstance(data, list) else (data.get("tickets") or data.get("data") or [])
@@ -210,8 +215,8 @@ def fetch_tickets_for_tienda_rango(nombre, api_key, desde_str, hasta_str):
         all_tickets.extend(batch)
         fechas = [date_str(t.get("created_date","")) for t in batch if t.get("created_date")]
         if fechas and min(fechas) < desde_str: break
-        if len(batch) < 50: break
-        page += 1
+        if len(batch) < PAGE_SIZE: break
+        offset += PAGE_SIZE
         time.sleep(0.3)
     en_ventana = [t for t in all_tickets if t.get("created_date") and desde_str <= date_str(t["created_date"]) <= hasta_str]
     print(f"[INFO] {nombre}: {len(en_ventana)} tickets ({desde_str} to {hasta_str})")
@@ -348,12 +353,12 @@ def fetch_payments_dia(fecha_str):
             continue
         headers = {"Authorization": key.strip(), "Accept": "application/json"}
         realizados = advances = 0.0
-        count = 0; page = 1
+        count = 0; offset = 0
         while True:
             try:
-                r = mgr_get("/payments", headers, params={"page": page}, contexto=f"payments {nombre} pag {page}")
+                r = mgr_get("/payments", headers, params={"limit": PAGE_SIZE, "offset": offset}, contexto=f"payments {nombre} offset {offset}")
             except Exception as e:
-                print(f"[FALLO PERSISTENTE] payments {nombre} pag {page} tras reintentos: {e} — total del día posiblemente incompleto")
+                print(f"[FALLO PERSISTENTE] payments {nombre} offset {offset} tras reintentos: {e} — total del día posiblemente incompleto")
                 break
             batch = r.json()
             if not isinstance(batch, list):
@@ -367,8 +372,8 @@ def fetch_payments_dia(fecha_str):
                 count += 1
             fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
             if fechas and min(fechas) < fecha_str: break
-            if len(batch) < 50: break
-            page += 1; time.sleep(0.2)
+            if len(batch) < PAGE_SIZE: break
+            offset += PAGE_SIZE; time.sleep(0.2)
         resultados[nombre] = {"realizados": round(realizados, 2),
             "advances": round(advances, 2), "total": round(realizados + advances, 2), "count": count}
         print(f"[INFO] payments {nombre} {fecha_str}: realizados={realizados} advances={advances} count={count}")
@@ -384,12 +389,12 @@ def fetch_payments_dia_raw(fecha_str):
             continue
         headers = {"Authorization": key.strip(), "Accept": "application/json"}
         pagos_dia = []
-        page = 1
+        offset = 0
         while True:
             try:
-                r = mgr_get("/payments", headers, params={"page": page}, contexto=f"payments_raw {nombre} pag {page}")
+                r = mgr_get("/payments", headers, params={"limit": PAGE_SIZE, "offset": offset}, contexto=f"payments_raw {nombre} offset {offset}")
             except Exception as e:
-                print(f"[FALLO PERSISTENTE] payments_raw {nombre} pag {page} tras reintentos: {e} — lista del día posiblemente incompleta")
+                print(f"[FALLO PERSISTENTE] payments_raw {nombre} offset {offset} tras reintentos: {e} — lista del día posiblemente incompleta")
                 break
             batch = r.json()
             if not isinstance(batch, list):
@@ -400,8 +405,8 @@ def fetch_payments_dia_raw(fecha_str):
             pagos_dia.extend(del_dia)
             fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
             if fechas and min(fechas) < fecha_str: break
-            if len(batch) < 50: break
-            page += 1; time.sleep(0.2)
+            if len(batch) < PAGE_SIZE: break
+            offset += PAGE_SIZE; time.sleep(0.2)
         resultados[nombre] = pagos_dia
     return resultados
 
@@ -610,12 +615,12 @@ def fetch_pos_dia(fecha_str):
             resultados[nombre] = {"total": 0.0, "count": 0}
             continue
         headers = {"Authorization": key.strip(), "Accept": "application/json"}
-        total = 0.0; count = 0; page = 1
+        total = 0.0; count = 0; offset = 0
         while True:
             try:
-                r = mgr_get("/posOrders", headers, params={"page": page}, contexto=f"posOrders {nombre} pag {page}")
+                r = mgr_get("/posOrders", headers, params={"limit": PAGE_SIZE, "offset": offset}, contexto=f"posOrders {nombre} offset {offset}")
             except Exception as e:
-                print(f"[FALLO PERSISTENTE] posOrders {nombre} pag {page} tras reintentos: {e} — total POS del día posiblemente incompleto")
+                print(f"[FALLO PERSISTENTE] posOrders {nombre} offset {offset} tras reintentos: {e} — total POS del día posiblemente incompleto")
                 break
             batch = r.json()
             if not isinstance(batch, list):
@@ -630,8 +635,8 @@ def fetch_pos_dia(fecha_str):
                 count += 1
             fechas = [date_str(o.get("created_date","")) for o in batch if o.get("created_date")]
             if fechas and min(fechas) < fecha_str: break
-            if len(batch) < 50: break
-            page += 1; time.sleep(0.2)
+            if len(batch) < PAGE_SIZE: break
+            offset += PAGE_SIZE; time.sleep(0.2)
         resultados[nombre] = {"total": round(total, 2), "count": count}
         print(f"[INFO] posOrders {nombre} {fecha_str}: total={total} count={count}")
     return resultados
