@@ -345,69 +345,58 @@ def get_all_cached(dias=None, desde=None, hasta=None):
         _cache_all["ts"]   = now
     return _cache_all["data"]
 
-def fetch_payments_dia(fecha_str):
-    resultados = {}
-    for nombre, key in TIENDAS_CONFIG.items():
-        if not key:
-            resultados[nombre] = {"realizados": 0.0, "advances": 0.0, "total": 0.0, "count": 0}
-            continue
-        headers = {"Authorization": key.strip(), "Accept": "application/json"}
-        realizados = advances = 0.0
-        count = 0; offset = 0
-        while True:
-            try:
-                r = mgr_get("/payments", headers, params={"limit": PAGE_SIZE, "offset": offset}, contexto=f"payments {nombre} offset {offset}")
-            except Exception as e:
-                print(f"[FALLO PERSISTENTE] payments {nombre} offset {offset} tras reintentos: {e} — total del día posiblemente incompleto")
-                break
-            batch = r.json()
-            if not isinstance(batch, list):
-                batch = batch.get("payments") or batch.get("data") or []
-            if not batch: break
-            del_dia = [p for p in batch if date_str(p.get("date","")) == fecha_str]
-            for p in del_dia:
-                monto = float(p.get("amount") or 0)
-                if p.get("is_advance"): advances   += monto
-                else:                   realizados += monto
-                count += 1
-            fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
-            if fechas and min(fechas) < fecha_str: break
-            if len(batch) < PAGE_SIZE: break
-            offset += PAGE_SIZE; time.sleep(0.2)
-        resultados[nombre] = {"realizados": round(realizados, 2),
-            "advances": round(advances, 2), "total": round(realizados + advances, 2), "count": count}
-        print(f"[INFO] payments {nombre} {fecha_str}: realizados={realizados} advances={advances} count={count}")
-    return resultados
+def _fetch_payments_tienda(nombre, key, fecha_str):
+    """Trae los pagos de un día para una tienda (offset/limit). Usada en paralelo por
+    fetch_payments_dia y fetch_payments_dia_raw — antes esto corría secuencial por
+    tienda (a diferencia de fetch_tickets_for_tienda_rango, que ya iba en threads),
+    lo cual sumado al proxy de ~30s de Railway hacía fallar /reporte/* y /debug/*
+    con un 500 genérico en cuanto había que paginar de verdad."""
+    if not key: return nombre, []
+    headers = {"Authorization": key.strip(), "Accept": "application/json"}
+    pagos_dia = []
+    offset = 0
+    while True:
+        try:
+            r = mgr_get("/payments", headers, params={"limit": PAGE_SIZE, "offset": offset}, contexto=f"payments {nombre} offset {offset}")
+        except Exception as e:
+            print(f"[FALLO PERSISTENTE] payments {nombre} offset {offset} tras reintentos: {e} — total del día posiblemente incompleto")
+            break
+        batch = r.json()
+        if not isinstance(batch, list):
+            batch = batch.get("payments") or batch.get("data") or []
+        if not batch: break
+        del_dia = [p for p in batch if date_str(p.get("date","")) == fecha_str]
+        for p in del_dia: p["_tienda"] = nombre
+        pagos_dia.extend(del_dia)
+        fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
+        if fechas and min(fechas) < fecha_str: break
+        if len(batch) < PAGE_SIZE: break
+        offset += PAGE_SIZE; time.sleep(0.2)
+    return nombre, pagos_dia
 
 def fetch_payments_dia_raw(fecha_str):
-    """Como fetch_payments_dia pero retorna los registros crudos (no solo sumas), para
-    poder conciliar cada pago contra el ticket que lo originó."""
+    """Trae los pagos crudos del día por tienda, en paralelo, para poder conciliar
+    cada pago contra el ticket que lo originó."""
     resultados = {}
-    for nombre, key in TIENDAS_CONFIG.items():
-        if not key:
-            resultados[nombre] = []
-            continue
-        headers = {"Authorization": key.strip(), "Accept": "application/json"}
-        pagos_dia = []
-        offset = 0
-        while True:
-            try:
-                r = mgr_get("/payments", headers, params={"limit": PAGE_SIZE, "offset": offset}, contexto=f"payments_raw {nombre} offset {offset}")
-            except Exception as e:
-                print(f"[FALLO PERSISTENTE] payments_raw {nombre} offset {offset} tras reintentos: {e} — lista del día posiblemente incompleta")
-                break
-            batch = r.json()
-            if not isinstance(batch, list):
-                batch = batch.get("payments") or batch.get("data") or []
-            if not batch: break
-            del_dia = [p for p in batch if date_str(p.get("date","")) == fecha_str]
-            for p in del_dia: p["_tienda"] = nombre
-            pagos_dia.extend(del_dia)
-            fechas = [date_str(p.get("date","")) for p in batch if p.get("date")]
-            if fechas and min(fechas) < fecha_str: break
-            if len(batch) < PAGE_SIZE: break
-            offset += PAGE_SIZE; time.sleep(0.2)
-        resultados[nombre] = pagos_dia
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(_fetch_payments_tienda, n, k, fecha_str): n for n, k in TIENDAS_CONFIG.items()}
+        for f in as_completed(futures):
+            nombre, pagos_dia = f.result()
+            resultados[nombre] = pagos_dia
+    return resultados
+
+def fetch_payments_dia(fecha_str):
+    crudo = fetch_payments_dia_raw(fecha_str)
+    resultados = {}
+    for nombre, pagos in crudo.items():
+        realizados = advances = 0.0
+        for p in pagos:
+            monto = float(p.get("amount") or 0)
+            if p.get("is_advance"): advances   += monto
+            else:                   realizados += monto
+        resultados[nombre] = {"realizados": round(realizados, 2), "advances": round(advances, 2),
+            "total": round(realizados + advances, 2), "count": len(pagos)}
+        print(f"[INFO] payments {nombre} {fecha_str}: realizados={realizados} advances={advances} count={len(pagos)}")
     return resultados
 
 def reconciliar_pagos_tickets(fecha_str, ventana_dias=90):
@@ -422,9 +411,12 @@ def reconciliar_pagos_tickets(fecha_str, ventana_dias=90):
       - cartera:   el ticket asociado fue creado antes de fecha_str
       - sin_match: no se encontró ningún ticket con ese timestamp exacto (revisar manualmente)
     """
-    pagos_por_tienda = fetch_payments_dia_raw(fecha_str)
     desde = (date.fromisoformat(fecha_str) - timedelta(days=ventana_dias)).isoformat()
-    tickets, _, _ = fetch_all_parallel(desde=desde, hasta=fecha_str)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_pagos   = ex.submit(fetch_payments_dia_raw, fecha_str)
+        f_tickets = ex.submit(fetch_all_parallel, desde=desde, hasta=fecha_str)
+        pagos_por_tienda = f_pagos.result()
+        tickets, _, _ = f_tickets.result()
 
     idx = {}
     for t in tickets:
@@ -520,9 +512,12 @@ def reconciliar_pagos_tickets_v2(fecha_str, ventana_dias=60):
     en vez de adivinar por timestamp (reconciliar_pagos_tickets, que falla ~78% de las
     veces — ver /debug/reconciliacion)."""
     t0 = time.time()
-    pagos_por_tienda = fetch_payments_dia_raw(fecha_str)
     desde = (date.fromisoformat(fecha_str) - timedelta(days=ventana_dias)).isoformat()
-    tickets, _, _ = fetch_all_parallel(desde=desde, hasta=fecha_str)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_pagos   = ex.submit(fetch_payments_dia_raw, fecha_str)
+        f_tickets = ex.submit(fetch_all_parallel, desde=desde, hasta=fecha_str)
+        pagos_por_tienda = f_pagos.result()
+        tickets, _, _ = f_tickets.result()
     idx_pago_ticket, detalle_por_ticket, fallidos, total_facturas = fetch_invoice_details_for_tickets(tickets)
 
     venta_dia = {"count": 0, "revenue": 0.0}
@@ -568,9 +563,14 @@ def reconciliar_pagos_tickets_v2(fecha_str, ventana_dias=60):
     }
 
 def get_dia_kpis(fecha_str):
-    payments = fetch_payments_dia(fecha_str)
     desde_30 = (date.fromisoformat(fecha_str) - timedelta(days=30)).isoformat()
-    tickets, _, _ = fetch_all_parallel(desde=desde_30, hasta=fecha_str)
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_payments = ex.submit(fetch_payments_dia, fecha_str)
+        f_tickets  = ex.submit(fetch_all_parallel, desde=desde_30, hasta=fecha_str)
+        f_pos      = ex.submit(fetch_pos_dia, fecha_str)
+        payments = f_payments.result()
+        tickets, _, _ = f_tickets.result()
+        pos = f_pos.result()
     tickets_del_dia = [t for t in tickets if fecha_pago_efectiva(t) == fecha_str]
     kpis = compute_kpis(tickets_del_dia, fecha_str, fecha_str)
     total_realizados = sum(v["realizados"] for v in payments.values())
@@ -600,45 +600,47 @@ def get_dia_kpis(fecha_str):
     ids_ya = {t.get("id") for t in tickets_del_dia}
     tickets_extra = [t for t in tickets_venta_dia if t.get("id") not in ids_ya]
     kpis["_tickets_raw"] = tickets_del_dia + tickets_extra
-    # Ventas POS del día
-    pos = fetch_pos_dia(fecha_str)
     kpis["pos_dia"]   = pos
     kpis["pos_total"] = round(sum(v["total"] for v in pos.values()), 2)
     kpis["pos_count"] = sum(v["count"] for v in pos.values())
     return kpis
 
+def _fetch_pos_tienda(nombre, key, fecha_str):
+    if not key: return nombre, {"total": 0.0, "count": 0}
+    headers = {"Authorization": key.strip(), "Accept": "application/json"}
+    total = 0.0; count = 0; offset = 0
+    while True:
+        try:
+            r = mgr_get("/posOrders", headers, params={"limit": PAGE_SIZE, "offset": offset}, contexto=f"posOrders {nombre} offset {offset}")
+        except Exception as e:
+            print(f"[FALLO PERSISTENTE] posOrders {nombre} offset {offset} tras reintentos: {e} — total POS del día posiblemente incompleto")
+            break
+        batch = r.json()
+        if not isinstance(batch, list):
+            batch = batch.get("orders") or batch.get("data") or []
+        if not batch: break
+        del_dia = [o for o in batch
+                   if date_str(o.get("created_date","")) == fecha_str
+                   and o.get("status") == "Paid"]
+        for o in del_dia:
+            try: total += float(o.get("amount_total") or 0)
+            except: pass
+            count += 1
+        fechas = [date_str(o.get("created_date","")) for o in batch if o.get("created_date")]
+        if fechas and min(fechas) < fecha_str: break
+        if len(batch) < PAGE_SIZE: break
+        offset += PAGE_SIZE; time.sleep(0.2)
+    print(f"[INFO] posOrders {nombre} {fecha_str}: total={total} count={count}")
+    return nombre, {"total": round(total, 2), "count": count}
+
 def fetch_pos_dia(fecha_str):
-    """Obtiene ventas POS del día desde /posOrders por tienda."""
+    """Obtiene ventas POS del día desde /posOrders por tienda, en paralelo."""
     resultados = {}
-    for nombre, key in TIENDAS_CONFIG.items():
-        if not key:
-            resultados[nombre] = {"total": 0.0, "count": 0}
-            continue
-        headers = {"Authorization": key.strip(), "Accept": "application/json"}
-        total = 0.0; count = 0; offset = 0
-        while True:
-            try:
-                r = mgr_get("/posOrders", headers, params={"limit": PAGE_SIZE, "offset": offset}, contexto=f"posOrders {nombre} offset {offset}")
-            except Exception as e:
-                print(f"[FALLO PERSISTENTE] posOrders {nombre} offset {offset} tras reintentos: {e} — total POS del día posiblemente incompleto")
-                break
-            batch = r.json()
-            if not isinstance(batch, list):
-                batch = batch.get("orders") or batch.get("data") or []
-            if not batch: break
-            del_dia = [o for o in batch
-                       if date_str(o.get("created_date","")) == fecha_str
-                       and o.get("status") == "Paid"]
-            for o in del_dia:
-                try: total += float(o.get("amount_total") or 0)
-                except: pass
-                count += 1
-            fechas = [date_str(o.get("created_date","")) for o in batch if o.get("created_date")]
-            if fechas and min(fechas) < fecha_str: break
-            if len(batch) < PAGE_SIZE: break
-            offset += PAGE_SIZE; time.sleep(0.2)
-        resultados[nombre] = {"total": round(total, 2), "count": count}
-        print(f"[INFO] posOrders {nombre} {fecha_str}: total={total} count={count}")
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(_fetch_pos_tienda, n, k, fecha_str): n for n, k in TIENDAS_CONFIG.items()}
+        for f in as_completed(futures):
+            nombre, data = f.result()
+            resultados[nombre] = data
     return resultados
 
 def fmt_q(valor): return f"Q {valor:,.2f}"
