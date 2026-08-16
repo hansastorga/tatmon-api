@@ -1038,6 +1038,8 @@ def debug_paginacion():
         {"page": 2},
         {"per_page": 50, "page": 2},
         {"limit": 50, "offset": 50},
+        {"limit": 50, "offset": 100},
+        {"limit": 50, "offset": 150},
         {"page": 2, "sort": "created_date"},
         {"page": 2, "sortBy": "createdDate", "sortDir": "desc"},
     ):
@@ -1046,9 +1048,26 @@ def debug_paginacion():
             b = r.json()
             count = len(b) if isinstance(b, list) else None
             primeros_ids = [t.get("id") for t in b[:3]] if isinstance(b, list) else None
-            resultados[str(params)] = {"status": r.status_code, "count": count, "primeros_ids": primeros_ids}
+            fechas = [date_str(t.get("created_date","")) for t in b] if isinstance(b, list) else None
+            resultados[str(params)] = {"status": r.status_code, "count": count, "primeros_ids": primeros_ids,
+                "min_fecha": min(fechas) if fechas else None, "max_fecha": max(fechas) if fechas else None}
         except Exception as e:
             resultados[str(params)] = {"error": str(e)}
+
+    for endpoint in ("/payments", "/posOrders"):
+        try:
+            r = requests.get(f"{MGR_BASE}{endpoint}", headers=headers, params={"limit": 50, "offset": 50}, timeout=15)
+            b = r.json()
+            count = len(b) if isinstance(b, list) else None
+            r0 = requests.get(f"{MGR_BASE}{endpoint}", headers=headers, params={"page": 1}, timeout=15)
+            b0 = r0.json()
+            mismos_ids = None
+            if isinstance(b, list) and isinstance(b0, list) and b and b0:
+                mismos_ids = (b[0].get("id") == b0[0].get("id"))
+            resultados[f"{endpoint} offset=50 vs page=1"] = {"status": r.status_code, "count_offset50": count,
+                "count_page1": len(b0) if isinstance(b0, list) else None, "primer_id_igual_a_page1": mismos_ids}
+        except Exception as e:
+            resultados[endpoint] = {"error": str(e)}
 
     return jsonify(resultados)
 
