@@ -1014,6 +1014,44 @@ def debug_tickets_pages():
             paginas.append({"page": page, "error": str(e)})
     return jsonify({"tienda": tienda, "paginas": paginas})
 
+@app.route("/debug/paginacion")
+def debug_paginacion():
+    """Investiga el mecanismo real de paginación de /tickets: headers de respuesta
+    (Link, X-Total-Count, etc.) y si parámetros alternos a 'page' (per_page, limit,
+    offset, sort) cambian el resultado. La doc de MGR solo dice 'máximo 50 registros
+    por request' sin detallar el resto — page 2 en adelante vino vacía en La Villa y
+    Kalú, lo cual puede significar que 'page' no es el parámetro correcto, o que de
+    verdad no hay más de 50 tickets accesibles así."""
+    tienda = request.args.get("tienda", "")
+    key = TIENDAS_CONFIG.get(tienda, "")
+    if not key: return jsonify({"error": f"tienda desconocida o sin key: {tienda}"}), 400
+    headers = {"Authorization": key.strip(), "Accept": "application/json"}
+    resultados = {}
+
+    r1 = requests.get(f"{MGR_BASE}/tickets", headers=headers, params={"page": 1}, timeout=15)
+    resultados["page=1_headers"] = dict(r1.headers)
+    b1 = r1.json()
+    resultados["page=1_count"] = len(b1) if isinstance(b1, list) else None
+    resultados["page=1_es_dict"] = None if isinstance(b1, list) else (list(b1.keys()) if isinstance(b1, dict) else None)
+
+    for params in (
+        {"page": 2},
+        {"per_page": 50, "page": 2},
+        {"limit": 50, "offset": 50},
+        {"page": 2, "sort": "created_date"},
+        {"page": 2, "sortBy": "createdDate", "sortDir": "desc"},
+    ):
+        try:
+            r = requests.get(f"{MGR_BASE}/tickets", headers=headers, params=params, timeout=15)
+            b = r.json()
+            count = len(b) if isinstance(b, list) else None
+            primeros_ids = [t.get("id") for t in b[:3]] if isinstance(b, list) else None
+            resultados[str(params)] = {"status": r.status_code, "count": count, "primeros_ids": primeros_ids}
+        except Exception as e:
+            resultados[str(params)] = {"error": str(e)}
+
+    return jsonify(resultados)
+
 @app.route("/debug/errores")
 def debug_errores():
     """Fallos persistentes (tras agotar reintentos) del fetch más reciente contra MGR.
